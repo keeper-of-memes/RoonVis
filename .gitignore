@@ -1,0 +1,27 @@
+# Build output
+.derived-data/
+Debug-*/
+Release-*/
+RoonVis/.DerivedData/
+RoonVis/build/
+RoonVis/build-host-tests/
+RoonVis/projectm-build/
+RoonVis/CMakeCache.txt
+RoonVis/CMakeFiles/
+RoonVis/CMakeScripts/
+RoonVis/cmake_install.cmake
+RoonVis/CPack*.cmake
+RoonVis/angle_sources.cmake
+
+# Xcode user state
+xcuserdata/
+*.xcuserdatad/
+RoonVis/RoonVis.xcodeproj/xcshareddata/
+RoonVis/UITests/RoonVisUITests.xcodeproj/project.xcworkspace/
+
+# Local scratch
+tmp/
+slip.wav
+
+# CMake-generated Xcode project (run the cmake -G Xcode command in CONTRIBUTING to regenerate)
+RoonVis/RoonVis.xcodeproj/

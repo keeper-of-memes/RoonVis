@@ -1,0 +1,2420 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 7e61f5266..662cb1d35 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -65,7 +65,7 @@ set(PROJECTM_SO_VERSION "4")
+ set(PROJECTM_LIBRARY_BASE_OUTPUT_NAME "projectM-${PROJECT_VERSION_MAJOR}")
+ 
+ # The actual (full) library version of projectM
+-set(PROJECTM_LIB_VERSION "${CMAKE_PROJECT_VERSION}")
++set(PROJECTM_LIB_VERSION "${PROJECT_VERSION}")
+ 
+ list(APPEND CMAKE_MODULE_PATH "${PROJECTM_SOURCE_DIR}/cmake")
+ 
+diff --git a/src/api/include/projectM-4/callbacks.h b/src/api/include/projectM-4/callbacks.h
+index 3ba9e1bcb..dd1700146 100644
+--- a/src/api/include/projectM-4/callbacks.h
++++ b/src/api/include/projectM-4/callbacks.h
+@@ -161,6 +161,54 @@ PROJECTM_EXPORT void projectm_set_texture_load_event_callback(projectm_handle in
+                                                               projectm_texture_load_event callback,
+                                                               void* user_data);
+ 
++/**
++ * @brief Optional hooks for caching the preprocessed-HLSL text of Milkdrop preset shaders.
++ *
++ * The Milkdrop shader transpiler runs a text preprocessor (macro expansion) over each
++ * preset shader before parsing it. That step is pure text and deterministic for a given
++ * input, so its result can be cached across runs. When these hooks are registered, projectM
++ * computes a stable key for the preprocessor input and consults the cache before running the
++ * (comparatively expensive) preprocessor.
++ *
++ * The cache is fully opt-in. If no hooks are registered, behaviour is byte-identical to a
++ * build without this feature. projectM owns nothing referenced by the value pointers after a
++ * callback returns; the get sink is only valid for the duration of the sink call.
++ *
++ * All hook invocations happen on the same thread that calls the projectM rendering
++ * functions (the transpile runs there), so no additional synchronization is required.
++ *
++ * @since 4.2.0
++ */
++typedef struct projectm_preprocess_cache_hooks {
++    /**
++     * @brief Lookup hook. On a hit, invoke @p sink exactly once with the cached value (valid
++     *        only for the duration of that call) and return true. On a miss, return false and
++     *        do not call @p sink.
++     */
++    bool (*get)(void* user, const char* key, size_t keylen,
++                void* sinkctx, void (*sink)(void* sinkctx, const char* data, size_t len));
++    /**
++     * @brief Store hook. Copy @p vallen bytes at @p value under the @p keylen-byte @p key.
++     *        The callee owns no passed-in pointer after returning.
++     */
++    void (*put)(void* user, const char* key, size_t keylen, const char* value, size_t vallen);
++    void* user; /**< User-defined pointer passed back to get/put. */
++} projectm_preprocess_cache_hooks;
++
++/**
++ * @brief Registers (or clears) the preprocessed-HLSL cache hooks for this instance.
++ *
++ * The hooks structure is copied by value; the caller need not keep it alive, but the @c user
++ * pointer and anything the callbacks touch must outlive the projectM instance (or until the
++ * hooks are cleared). Passing NULL clears any previously registered hooks.
++ *
++ * @param instance The projectM instance handle.
++ * @param hooks A pointer to the hooks structure, or NULL to clear.
++ * @since 4.2.0
++ */
++PROJECTM_EXPORT void projectm_set_preprocess_cache(projectm_handle instance,
++                                                   const projectm_preprocess_cache_hooks* hooks);
++
+ #ifdef __cplusplus
+ } // extern "C"
+ #endif
+diff --git a/src/api/include/projectM-4/core.h b/src/api/include/projectM-4/core.h
+index 9a42545ac..7e95a10e3 100644
+--- a/src/api/include/projectM-4/core.h
++++ b/src/api/include/projectM-4/core.h
+@@ -108,6 +108,21 @@ PROJECTM_EXPORT void projectm_destroy(projectm_handle instance);
+ PROJECTM_EXPORT void projectm_load_preset_file(projectm_handle instance, const char* filename,
+                                                bool smooth_transition);
+ 
++PROJECTM_EXPORT void projectm_preload_preset_file(projectm_handle instance, const char* filename);
++
++PROJECTM_EXPORT bool projectm_activate_preloaded_preset(projectm_handle instance,
++                                                        bool smooth_transition);
++
++PROJECTM_EXPORT bool projectm_has_preloaded_preset(projectm_handle instance);
++
++/**
++ * @brief Non-blocking: true once the preloaded preset's deferred background shader
++ *        compiles have finished (GL_KHR_parallel_shader_compile). False if nothing is
++ *        preloaded. Gate projectm_activate_preloaded_preset() on this to keep the
++ *        finalize step instant.
++ */
++PROJECTM_EXPORT bool projectm_preloaded_preset_compile_ready(projectm_handle instance);
++
+ /**
+  * @brief Loads a preset from the data pointer.
+  *
+diff --git a/src/libprojectM/Audio/PCM.cpp b/src/libprojectM/Audio/PCM.cpp
+index 1deea37ae..d7d18747e 100755
+--- a/src/libprojectM/Audio/PCM.cpp
++++ b/src/libprojectM/Audio/PCM.cpp
+@@ -62,14 +62,20 @@ void PCM::UpdateFrameAudioData(double secondsSinceLastFrame, uint32_t frame)
+     UpdateSpectrum(m_waveformL, m_spectrumL);
+     UpdateSpectrum(m_waveformR, m_spectrumR);
+ 
++    SpectrumBuffer monoSpectrum{};
++    for (size_t sample = 0; sample < SpectrumSamples; sample++)
++    {
++        monoSpectrum[sample] = 0.5f * (m_spectrumL[sample] + m_spectrumR[sample]);
++    }
++
+     // 3. Align waveforms
+     m_alignL.Align(m_waveformL);
+     m_alignR.Align(m_waveformR);
+ 
+     // 4. Update beat detection values
+-    m_bass.Update(m_spectrumL, secondsSinceLastFrame, frame);
+-    m_middles.Update(m_spectrumL, secondsSinceLastFrame, frame);
+-    m_treble.Update(m_spectrumL, secondsSinceLastFrame, frame);
++    m_bass.Update(monoSpectrum, secondsSinceLastFrame, frame);
++    m_middles.Update(monoSpectrum, secondsSinceLastFrame, frame);
++    m_treble.Update(monoSpectrum, secondsSinceLastFrame, frame);
+ 
+ }
+ 
+diff --git a/src/libprojectM/MilkdropPreset/CMakeLists.txt b/src/libprojectM/MilkdropPreset/CMakeLists.txt
+index d6682ae8a..a280b7635 100644
+--- a/src/libprojectM/MilkdropPreset/CMakeLists.txt
++++ b/src/libprojectM/MilkdropPreset/CMakeLists.txt
+@@ -33,6 +33,11 @@ add_custom_command(OUTPUT
+         GenerateStaticShaders.cmake
+         )
+ 
++file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/MilkdropPresetFactory.cpp"
++        "#include \"${CMAKE_CURRENT_SOURCE_DIR}/Factory.cpp\"\n")
++file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/MilkdropPresetWaveformFactory.cpp"
++        "#include \"${CMAKE_CURRENT_SOURCE_DIR}/Waveforms/Factory.cpp\"\n")
++
+ add_library(MilkdropPreset OBJECT
+         ${SHADER_FILES}
+         ${CMAKE_CURRENT_BINARY_DIR}/MilkdropStaticShaders.cpp
+@@ -49,7 +54,7 @@ add_library(MilkdropPreset OBJECT
+         DarkenCenter.cpp
+         DarkenCenter.hpp
+         EvalLibMutex.cpp
+-        Factory.cpp
++        ${CMAKE_CURRENT_BINARY_DIR}/MilkdropPresetFactory.cpp
+         Factory.hpp
+         Filters.cpp
+         Filters.hpp
+@@ -62,6 +67,8 @@ add_library(MilkdropPreset OBJECT
+         MilkdropPresetExceptions.hpp
+         MilkdropShader.cpp
+         MilkdropShader.hpp
++        MilkdropShaderPreprocess.cpp
++        MilkdropShaderPreprocess.hpp
+         MilkdropStaticShaders.cpp.in
+         MilkdropStaticShaders.hpp.in
+         MotionVectors.cpp
+@@ -97,7 +104,7 @@ add_library(MilkdropPreset OBJECT
+         Waveforms/DoubleLine.hpp
+         Waveforms/ExplosiveHash.cpp
+         Waveforms/ExplosiveHash.hpp
+-        Waveforms/Factory.cpp
++        ${CMAKE_CURRENT_BINARY_DIR}/MilkdropPresetWaveformFactory.cpp
+         Waveforms/Factory.hpp
+         Waveforms/Line.cpp
+         Waveforms/Line.hpp
+diff --git a/src/libprojectM/MilkdropPreset/FinalComposite.cpp b/src/libprojectM/MilkdropPreset/FinalComposite.cpp
+index 693df4493..9aa3153a6 100644
+--- a/src/libprojectM/MilkdropPreset/FinalComposite.cpp
++++ b/src/libprojectM/MilkdropPreset/FinalComposite.cpp
+@@ -94,6 +94,34 @@ void FinalComposite::CompileCompositeShader(PresetState& presetState)
+     }
+ }
+ 
++auto FinalComposite::CompositeShaderCompileReady() const -> bool
++{
++    return !m_compositeShader || m_compositeShader->Shader().PendingCompileReady();
++}
++
++void FinalComposite::FinalizeCompositeShaderCompile(PresetState& presetState)
++{
++    if (m_compositeShader && m_compositeShader->Shader().HasPendingCompile())
++    {
++        try
++        {
++            m_compositeShader->Shader().FinalizeCompile();
++            LOG_DEBUG("[FinalComposite] Successfully finalized deferred composite shader compile.");
++        }
++        catch (Renderer::ShaderException&)
++        {
++            // Same failure handling as CompileCompositeShader. Deferral is off by
++            // finalize time, so the fallback compiles synchronously (static source,
++            // rare path — only broken presets reach it).
++            LOG_WARN("[FinalComposite] Error compiling composite warp shader code (deferred) - Using fallback shader.");
++
++            m_compositeShader = std::make_unique<MilkdropShader>(MilkdropShader::ShaderType::CompositeShader);
++            m_compositeShader->LoadCode(defaultCompositeShader);
++            m_compositeShader->LoadTexturesAndCompile(presetState);
++        }
++    }
++}
++
+ void FinalComposite::Draw(const PresetState& presetState, const PerFrameContext& perFrameContext)
+ {
+     if (m_compositeShader)
+diff --git a/src/libprojectM/MilkdropPreset/FinalComposite.hpp b/src/libprojectM/MilkdropPreset/FinalComposite.hpp
+index 970144770..af874e016 100644
+--- a/src/libprojectM/MilkdropPreset/FinalComposite.hpp
++++ b/src/libprojectM/MilkdropPreset/FinalComposite.hpp
+@@ -31,6 +31,19 @@ public:
+      */
+     void CompileCompositeShader(PresetState& presetState);
+ 
++    /**
++     * RoonVis local patch (Phase 3c): true once the composite shader's deferred
++     * background compile (if any) has finished. Non-blocking.
++     */
++    auto CompositeShaderCompileReady() const -> bool;
++
++    /**
++     * RoonVis local patch (Phase 3c): finalizes a deferred composite-shader compile,
++     * replaying CompileCompositeShader's failure handling (fall back to the default
++     * composite shader, compiled synchronously).
++     */
++    void FinalizeCompositeShaderCompile(PresetState& presetState);
++
+     /**
+      * @brief Renders the composite quad with the appropriate effects or shaders.
+      * @param presetState The preset state to retrieve the configuration values from.
+diff --git a/src/libprojectM/MilkdropPreset/MilkdropPreset.cpp b/src/libprojectM/MilkdropPreset/MilkdropPreset.cpp
+index ef1716115..e2c27c41b 100755
+--- a/src/libprojectM/MilkdropPreset/MilkdropPreset.cpp
++++ b/src/libprojectM/MilkdropPreset/MilkdropPreset.cpp
+@@ -27,9 +27,28 @@
+ 
+ #include <Logging.hpp>
+ 
++#include <chrono>
++#include <iomanip>
++#include <sstream>
++
+ namespace libprojectM {
+ namespace MilkdropPreset {
+ 
++// RoonVis local patch: helpers for the opt-in per-frame eval profiler
++// (ROONVIS_PROJECTM_EVAL_PROFILE, see EvalProfiler in PerPixelMesh.hpp).
++namespace {
++
++using EvalProfileClock = std::chrono::steady_clock;
++
++constexpr int kEvalProfileEmitFrameInterval = 10;  // low enough that ~1fps catastrophic presets still emit within a rotation slot
++
++auto EvalProfileMilliseconds(EvalProfileClock::time_point start, EvalProfileClock::time_point end) -> double
++{
++    return std::chrono::duration<double, std::milli>(end - start).count();
++}
++
++} // namespace
++
+ MilkdropPreset::MilkdropPreset(const std::string& absoluteFilePath)
+     : m_absoluteFilePath(absoluteFilePath)
+     , m_perFrameContext(m_state.globalMemory, &m_state.globalRegisters)
+@@ -39,7 +58,14 @@ MilkdropPreset::MilkdropPreset(const std::string& absoluteFilePath)
+     , m_darkenCenter(m_state)
+     , m_border(m_state)
+ {
++    // RoonVis local patch: load-split probe — time the constructor (parse + preprocess).
++    const bool evalProfile = EvalProfiler::Enabled();
++    const auto constructStart = evalProfile ? EvalProfileClock::now() : EvalProfileClock::time_point{};
+     Load(absoluteFilePath);
++    if (evalProfile)
++    {
++        m_loadSplitConstructMs = EvalProfileMilliseconds(constructStart, EvalProfileClock::now());
++    }
+ }
+ 
+ MilkdropPreset::MilkdropPreset(std::istream& presetData)
+@@ -50,11 +76,27 @@ MilkdropPreset::MilkdropPreset(std::istream& presetData)
+     , m_darkenCenter(m_state)
+     , m_border(m_state)
+ {
++    // RoonVis local patch: load-split probe — time the constructor (parse + preprocess).
++    const bool evalProfile = EvalProfiler::Enabled();
++    const auto constructStart = evalProfile ? EvalProfileClock::now() : EvalProfileClock::time_point{};
+     Load(presetData);
++    if (evalProfile)
++    {
++        m_loadSplitConstructMs = EvalProfileMilliseconds(constructStart, EvalProfileClock::now());
++    }
+ }
+ 
+ void MilkdropPreset::Initialize(const Renderer::RenderContext& renderContext)
+ {
++    // RoonVis local patch: load-split probe — attribute LOAD/INIT cost to eval-code
++    // compilation vs shader compilation (ROONVIS_PROJECTM_EVAL_PROFILE, zero cost off).
++    const bool evalProfile = EvalProfiler::Enabled();
++    if (evalProfile)
++    {
++        EvalProfiler::LoadSplitReset();
++    }
++    const auto initializeStart = evalProfile ? EvalProfileClock::now() : EvalProfileClock::time_point{};
++
+     assert(renderContext.textureManager);
+     m_state.renderContext = renderContext;
+     m_state.blurTexture.Initialize(renderContext);
+@@ -73,10 +115,30 @@ void MilkdropPreset::Initialize(const Renderer::RenderContext& renderContext)
+ 
+     m_perPixelMesh.CompileWarpShader(m_state);
+     m_finalComposite.CompileCompositeShader(m_state);
++
++    if (evalProfile)
++    {
++        const auto& split = EvalProfiler::LoadSplitTotals();
++        const double totalMs = m_loadSplitConstructMs +
++                               EvalProfileMilliseconds(initializeStart, EvalProfileClock::now());
++        std::ostringstream line;
++        line << std::fixed << std::setprecision(3)
++             << "ProjectMLoadSplit:"
++             << " preset=" << (Filename().empty() ? std::string("<stream>") : Filename())
++             << " evalCompileMs=" << split.evalCompileMs
++             << " shaderCompileMs=" << split.shaderCompileMs
++             << " otherMs=" << totalMs - split.evalCompileMs - split.shaderCompileMs
++             << " totalMs=" << totalMs;
++        LOG_INFO(line.str());
++    }
+ }
+ 
+ void MilkdropPreset::RenderFrame(const libprojectM::Audio::FrameAudioData& audioData, const Renderer::RenderContext& renderContext)
+ {
++    // RoonVis local patch: opt-in per-frame cost attribution (zero clock calls when off).
++    const bool evalProfile = EvalProfiler::Enabled();
++    const auto frameStart = evalProfile ? EvalProfileClock::now() : EvalProfileClock::time_point{};
++
+     m_state.audioData = audioData;
+     m_state.renderContext = renderContext;
+ 
+@@ -114,6 +176,12 @@ void MilkdropPreset::RenderFrame(const libprojectM::Audio::FrameAudioData& audio
+ 
+     // Draw previous frame image warped via per-pixel mesh and warp shader
+     m_perPixelMesh.Draw(m_state, m_perFrameContext, m_perPixelContext);
++    if (evalProfile)
++    {
++        const auto& warpTimings = EvalProfiler::LastWarpPassTimings();
++        m_evalProfile.vertexEvalMs += warpTimings.vertexEvalMs;
++        m_evalProfile.warpDrawMs += warpTimings.warpDrawMs;
++    }
+ 
+     // Remove the u/v texture from the framebuffer.
+     m_framebuffer.RemoveColorAttachment(m_currentFrameBuffer, 1);
+@@ -126,15 +194,25 @@ void MilkdropPreset::RenderFrame(const libprojectM::Audio::FrameAudioData& audio
+     }
+ 
+     // Draw audio-data-related stuff
++    const auto shapesStart = evalProfile ? EvalProfileClock::now() : EvalProfileClock::time_point{};
+     for (auto& shape : m_customShapes)
+     {
+         shape->Draw();
+     }
++    const auto wavesStart = evalProfile ? EvalProfileClock::now() : EvalProfileClock::time_point{};
++    if (evalProfile)
++    {
++        m_evalProfile.shapeMs += EvalProfileMilliseconds(shapesStart, wavesStart);
++    }
+     for (auto& wave : m_customWaveforms)
+     {
+         wave->Draw(m_perFrameContext);
+     }
+     m_waveform.Draw(m_perFrameContext);
++    if (evalProfile)
++    {
++        m_evalProfile.waveMs += EvalProfileMilliseconds(wavesStart, EvalProfileClock::now());
++    }
+ 
+     // Done in DrawSprites() in Milkdrop
+     if (*m_perFrameContext.darken_center > 0)
+@@ -144,6 +222,7 @@ void MilkdropPreset::RenderFrame(const libprojectM::Audio::FrameAudioData& audio
+     m_border.Draw(m_perFrameContext);
+ 
+     // y-flip the image for final compositing again
++    const auto compositeStart = evalProfile ? EvalProfileClock::now() : EvalProfileClock::time_point{};
+     m_flipTexture.Draw(*renderContext.shaderCache, m_framebuffer.GetColorAttachmentTexture(m_currentFrameBuffer, 0), nullptr, true, false);
+     m_state.mainTexture = m_flipTexture.Texture();
+ 
+@@ -163,6 +242,31 @@ void MilkdropPreset::RenderFrame(const libprojectM::Audio::FrameAudioData& audio
+     std::swap(m_currentFrameBuffer, m_previousFrameBuffer);
+ 
+     m_isFirstFrame = false;
++
++    if (evalProfile)
++    {
++        const auto frameEnd = EvalProfileClock::now();
++        m_evalProfile.compositeMs += EvalProfileMilliseconds(compositeStart, frameEnd);
++        m_evalProfile.totalMs += EvalProfileMilliseconds(frameStart, frameEnd);
++
++        if (++m_evalProfile.frameCount >= kEvalProfileEmitFrameInterval)
++        {
++            const auto frames = static_cast<double>(m_evalProfile.frameCount);
++            std::ostringstream line;
++            line << std::fixed << std::setprecision(3)
++                 << "ProjectMFrameBreakdown:"
++                 << " preset=" << (Filename().empty() ? std::string("<stream>") : Filename())
++                 << " frames=" << m_evalProfile.frameCount
++                 << " vertexEvalMs=" << m_evalProfile.vertexEvalMs / frames
++                 << " waveMs=" << m_evalProfile.waveMs / frames
++                 << " shapeMs=" << m_evalProfile.shapeMs / frames
++                 << " warpDrawMs=" << m_evalProfile.warpDrawMs / frames
++                 << " compositeMs=" << m_evalProfile.compositeMs / frames
++                 << " totalMs=" << m_evalProfile.totalMs / frames;
++            LOG_INFO(line.str());
++            m_evalProfile = {};
++        }
++    }
+ }
+ 
+ auto MilkdropPreset::OutputTexture() const -> std::shared_ptr<Renderer::Texture>
+@@ -179,6 +283,17 @@ void MilkdropPreset::DrawInitialImage(const std::shared_ptr<Renderer::Texture>&
+     m_flipTexture.Draw(*renderContext.shaderCache, image, m_framebuffer, m_previousFrameBuffer);
+ }
+ 
++auto MilkdropPreset::PendingShaderCompileReady() const -> bool
++{
++    return m_perPixelMesh.WarpShaderCompileReady() && m_finalComposite.CompositeShaderCompileReady();
++}
++
++void MilkdropPreset::FinalizePendingShaderCompile()
++{
++    m_perPixelMesh.FinalizeWarpShaderCompile();
++    m_finalComposite.FinalizeCompositeShaderCompile(m_state);
++}
++
+ void MilkdropPreset::BindFramebuffer()
+ {
+     if (m_framebuffer.Width() > 0 && m_framebuffer.Height() > 0)
+diff --git a/src/libprojectM/MilkdropPreset/MilkdropPreset.hpp b/src/libprojectM/MilkdropPreset/MilkdropPreset.hpp
+index db8eb43ba..14fb82000 100644
+--- a/src/libprojectM/MilkdropPreset/MilkdropPreset.hpp
++++ b/src/libprojectM/MilkdropPreset/MilkdropPreset.hpp
+@@ -86,6 +86,18 @@ public:
+ 
+     void BindFramebuffer() override;
+ 
++    /**
++     * RoonVis local patch (Phase 3c): non-blocking readiness of the warp/composite
++     * shaders' deferred background compiles.
++     */
++    auto PendingShaderCompileReady() const -> bool override;
++
++    /**
++     * RoonVis local patch (Phase 3c): finalizes deferred warp/composite compiles with
++     * the same per-shader failure fallbacks as the synchronous compile path.
++     */
++    void FinalizePendingShaderCompile() override;
++
+ private:
+     void PerFrameUpdate();
+ 
+@@ -129,6 +141,30 @@ private:
+     FinalComposite m_finalComposite; //!< Final composite shader or filters.
+ 
+     bool m_isFirstFrame{true}; //!< Controls drawing the motion vectors starting with the second frame.
++
++    /**
++     * RoonVis local patch: per-preset frame-cost accumulators for the opt-in eval
++     * profiler (ROONVIS_PROJECTM_EVAL_PROFILE, see EvalProfiler in PerPixelMesh.hpp).
++     * Averaged and emitted as one "ProjectMFrameBreakdown:" log line every N frames.
++     */
++    struct EvalProfileAccumulators {
++        double vertexEvalMs{}; //!< Per-vertex/per-pixel expression evaluation (CPU).
++        double waveMs{};       //!< Custom + default waveform eval and draw.
++        double shapeMs{};      //!< Custom shape eval and draw.
++        double warpDrawMs{};   //!< Warp pass GL submission (buffer uploads + draw).
++        double compositeMs{};  //!< Final composite pass (flip + composite draw).
++        double totalMs{};      //!< Whole RenderFrame call.
++        int frameCount{};      //!< Frames accumulated since the last emitted line.
++    };
++    EvalProfileAccumulators m_evalProfile; //!< Eval profiler accumulators (unused unless enabled).
++
++    /**
++     * RoonVis local patch: wall-clock time spent in the constructor (file parse +
++     * shader-code preprocessing), part of the opt-in load-split probe. Added to the
++     * Initialize() duration and emitted as one "ProjectMLoadSplit:" line (same
++     * ROONVIS_PROJECTM_EVAL_PROFILE gate). Always 0 when the profiler is disabled.
++     */
++    double m_loadSplitConstructMs{};
+ };
+ 
+ } // namespace MilkdropPreset
+diff --git a/src/libprojectM/MilkdropPreset/MilkdropShader.cpp b/src/libprojectM/MilkdropPreset/MilkdropShader.cpp
+index 10cf919ca..d93a8650d 100644
+--- a/src/libprojectM/MilkdropPreset/MilkdropShader.cpp
++++ b/src/libprojectM/MilkdropPreset/MilkdropShader.cpp
+@@ -1,5 +1,7 @@
+ #include "MilkdropShader.hpp"
+ 
++#include "MilkdropShaderPreprocess.hpp" // RoonVis local patch: GL-free preprocessor-input assembly.
++#include "PerPixelMesh.hpp" // RoonVis local patch: EvalProfiler load-split probe.
+ #include "PresetState.hpp"
+ #include "Utils.hpp"
+ 
+@@ -141,7 +143,11 @@ void MilkdropShader::LoadTexturesAndCompile(PresetState& presetState)
+     }
+ 
+     // Now that we have the textures, transpile the code.
++    // RoonVis local patch: load-split probe — covers hlslparser preprocessing/parsing,
++    // GLSL generation and the GL program compile/link inside TranspileHLSLShader.
++    const auto shaderCompileStartMs = EvalProfiler::LoadSplitNowMs();
+     TranspileHLSLShader(presetState, m_preprocessedCode);
++    EvalProfiler::LoadSplitAddShaderCompile(shaderCompileStartMs);
+ 
+     // Update blur texture level if shader was compiled successfully.
+     presetState.blurTexture.SetRequiredBlurLevel(m_maxBlurLevelRequired);
+@@ -331,182 +337,12 @@ auto MilkdropShader::Shader() -> Renderer::Shader&
+ 
+ void MilkdropShader::PreprocessPresetShader(std::string& program)
+ {
+-    std::string shaderTypeString = "composite";
+-    if (m_type == ShaderType::WarpShader)
+-    {
+-        shaderTypeString = "warp";
+-    }
+-
+-    if (program.length() <= 0)
+-    {
+-        throw Renderer::ShaderException("[MilkdropShader] Preset " + shaderTypeString + " shader is declared, but empty.");
+-    }
+-
+-    size_t found;
+-
+-    // Find "sampler_state" overrides and remove them first, as they're not supported by GLSL.
+-    // The logic isn't totally fool-proof, but should work in general.
+-    // Use a comment-stripped copy for searching so commented-out sampler_state blocks are skipped.
+-    // StripComments preserves string length, so positions map 1:1 to the original.
+-    std::string stripped = Utils::StripComments(program);
+-    found = stripped.find("sampler_state");
+-    while (found != std::string::npos)
+-    {
+-        // Now go backwards and find the assignment
+-        found = stripped.rfind('=', found);
+-        auto startPos = found;
+-
+-        // Find closing brace and semicolon
+-        found = stripped.find('}', found);
+-        found = stripped.find(';', found);
+-
+-        if (found != std::string::npos)
+-        {
+-            stripped.replace(startPos, found - startPos, "");
+-        }
+-        else
+-        {
+-            // No closing brace and semicolon.
+-            break;
+-        }
+-
+-        found = stripped.find("sampler_state");
+-    }
+-
+-    // replace shader_body with entry point function
+-    // Use the stripped copy so a commented-out shader_body is not matched.
+-    found = stripped.find("shader_body");
+-    if (found != std::string::npos)
+-    {
+-        if (m_type == ShaderType::WarpShader)
+-        {
+-            program.replace(int(found), 11, R"(
+-void PS(float4 _vDiffuse : COLOR,
+-        float4 _uv : TEXCOORD0,
+-        float2 _rad_ang : TEXCOORD1,
+-        out float4 _return_value : COLOR0,
+-        out float4 _mv_tex_coords : COLOR1)
+-)");
+-        }
+-        else
+-        {
+-            program.replace(int(found), 11, R"(
+-void PS(float4 _vDiffuse : COLOR,
+-        float2 _uv : TEXCOORD0,
+-        float2 _rad_ang : TEXCOORD1,
+-        out float4 _return_value : COLOR)
+-)");
+-        }
+-    }
+-    else
+-    {
+-        LOG_DEBUG("[MilkdropShader] Failed " + shaderTypeString + " shader code:\n" + program);
+-        throw Renderer::ShaderException("[MilkdropShader] Preset " + shaderTypeString + " shader is missing \"shader_body\" entry point.");
+-    }
+-
+-    // replace the "{" immediately following shader_body with some variable declarations
+-    found = program.find('{', found);
+-    if (found != std::string::npos)
+-    {
+-        std::string progMain = "{\nfloat3 ret = 0;\n";
+-        if (m_type == ShaderType::WarpShader)
+-        {
+-            progMain.append("_mv_tex_coords.xy = _uv.xy;\n");
+-        }
+-        program.replace(int(found), 1, progMain);
+-    }
+-    else
+-    {
+-        LOG_DEBUG("[MilkdropShader] Failed " + shaderTypeString + " shader code:\n" + program);
+-        throw Renderer::ShaderException("[MilkdropShader] Preset " + shaderTypeString + " shader has no opening braces.");
+-    }
+-
+-    // replace "}" with return statement (this can probably be optimized for the GLSL conversion...)
+-    found = program.rfind('}');
+-    if (found != std::string::npos)
+-    {
+-        program.replace(int(found), 1, "_return_value = float4(ret.xyz, 1.0);\n"
+-                                       "}\n");
+-    }
+-    else
+-    {
+-        LOG_DEBUG("[MilkdropShader] Failed " + shaderTypeString + " shader code:\n" + program);
+-        throw Renderer::ShaderException("[MilkdropShader] Preset " + shaderTypeString + " shader has no closing brace.");
+-    }
+-
+-    // Find matching closing brace and cut off excess text after shader's main function
+-    int bracesOpen = 1;
+-    size_t pos = found + 1;
+-    for (; pos < program.length() && bracesOpen > 0; ++pos)
+-    {
+-        switch (program.at(pos))
+-        {
+-            case '/':
+-                // Skip line comments until EoL to prevent false counting
+-                if (pos < program.length() - 1 && program.at(pos + 1) == '/')
+-                {
+-                    for (; pos < program.length(); ++pos)
+-                    {
+-                        if (program.at(pos) == '\n')
+-                        {
+-                            break;
+-                        }
+-                    }
+-                }
+-                // Skip block comments to prevent false counting
+-                else if (pos < program.length() - 1 && program.at(pos + 1) == '*')
+-                {
+-                    pos += 2;
+-                    for (; pos < program.length() - 1; ++pos)
+-                    {
+-                        if (program.at(pos) == '*' && program.at(pos + 1) == '/')
+-                        {
+-                            ++pos; // skip past '/'
+-                            break;
+-                        }
+-                    }
+-                }
+-                continue;
+-
+-            case '{':
+-                bracesOpen++;
+-                continue;
+-
+-            case '}':
+-                bracesOpen--;
+-        }
+-    }
+-
+-    if (pos < program.length() - 1)
+-    {
+-        program.resize(pos);
+-    }
+-
+-    std::string fullSource; //!< Full shader source before translation, includes all uniforms etc.
+-
+-    // First copy the generic "header" into the shader. Includes uniforms and some defines
+-    // to unwrap the packed 4-element uniforms into single values.
+-    fullSource.append(MilkdropStaticShaders::Get()->GetPresetShaderHeader());
+-
+-    if (m_type == ShaderType::WarpShader)
+-    {
+-        fullSource.append("#define rad _rad_ang.x\n"
+-                          "#define ang _rad_ang.y\n"
+-                          "#define uv _uv.xy\n"
+-                          "#define uv_orig _uv.zw\n");
+-    }
+-    else
+-    {
+-        fullSource.append("#define rad _rad_ang.x\n"
+-                          "#define ang _rad_ang.y\n"
+-                          "#define uv _uv.xy\n"
+-                          "#define uv_orig _uv.xy\n"
+-                          "#define hue_shader _vDiffuse.xyz\n");
+-    }
+-
+-    fullSource.append(program);
+-
+-    program = fullSource;
++    // RoonVis local patch: the pure-text assembly was extracted verbatim into the GL-free
++    // free function AssembleApplyPreprocessorInput(type, body) so a build-time host tool and
++    // the runtime produce byte-identical preprocessor input. This wrapper preserves the
++    // original in/out contract (mutates `program` in place). GetReferencedSamplers still runs
++    // separately in LoadCode, so m_samplerNames population is unchanged.
++    program = AssembleApplyPreprocessorInput(m_type, program);
+ }
+ 
+ void MilkdropShader::GetReferencedSamplers(const std::string& program)
+@@ -615,12 +451,42 @@ void MilkdropShader::TranspileHLSLShader(const PresetState& presetState, std::st
+     M4::HLSLTree tree(&allocator);
+     M4::HLSLParser parser(&allocator, &tree);
+ 
+-    // Preprocess define macros
++    // Preprocess define macros. Optionally short-circuit via the app-provided preprocessed-
++    // HLSL cache: the preprocessor output is a pure, deterministic function of `program`, so
++    // a hit lets us skip ApplyPreprocessor entirely. With no hooks registered this path is
++    // byte-identical to the historical behaviour.
+     std::string sourcePreprocessed;
+-    if (!parser.ApplyPreprocessor("", program.c_str(), program.size(), sourcePreprocessed))
+-    {
+-        LOG_DEBUG("[MilkdropShader] Failed " + shaderTypeString + " shader code:\n" + program);
+-        throw Renderer::ShaderException("Error translating HLSL " + shaderTypeString + " shader: Preprocessing failed.");
++    const auto* preprocessCacheHooks = presetState.renderContext.preprocessCache;
++    bool preprocessCacheHit = false;
++    std::string preprocessCacheKey;
++    if (preprocessCacheHooks != nullptr && preprocessCacheHooks->get != nullptr)
++    {
++        preprocessCacheKey = ComputePreprocessCacheKey(program);
++        // Sink appends the cached bytes into sourcePreprocessed for the duration of the call.
++        auto appendSink = [](void* sinkctx, const char* data, size_t len) {
++            auto* out = static_cast<std::string*>(sinkctx);
++            out->append(data, len);
++        };
++        preprocessCacheHit = preprocessCacheHooks->get(preprocessCacheHooks->user,
++                                                       preprocessCacheKey.data(), preprocessCacheKey.size(),
++                                                       &sourcePreprocessed, appendSink);
++    }
++
++    if (!preprocessCacheHit)
++    {
++        sourcePreprocessed.clear();
++        if (!parser.ApplyPreprocessor("", program.c_str(), program.size(), sourcePreprocessed))
++        {
++            LOG_DEBUG("[MilkdropShader] Failed " + shaderTypeString + " shader code:\n" + program);
++            throw Renderer::ShaderException("Error translating HLSL " + shaderTypeString + " shader: Preprocessing failed.");
++        }
++
++        if (preprocessCacheHooks != nullptr && preprocessCacheHooks->put != nullptr)
++        {
++            preprocessCacheHooks->put(preprocessCacheHooks->user,
++                                      preprocessCacheKey.data(), preprocessCacheKey.size(),
++                                      sourcePreprocessed.data(), sourcePreprocessed.size());
++        }
+     }
+ 
+     // Remove previous shader declarations
+diff --git a/src/libprojectM/MilkdropPreset/MilkdropShaderPreprocess.cpp b/src/libprojectM/MilkdropPreset/MilkdropShaderPreprocess.cpp
+new file mode 100644
+index 000000000..315a00228
+--- /dev/null
++++ b/src/libprojectM/MilkdropPreset/MilkdropShaderPreprocess.cpp
+@@ -0,0 +1,251 @@
++#include "MilkdropShaderPreprocess.hpp"
++
++#include "Utils.hpp"
++
++#include <MilkdropStaticShaders.hpp>
++
++#include <Logging.hpp>
++#include <Renderer/Shader.hpp>
++
++#include <cstddef>
++#include <cstdint>
++#include <cstdio>
++#include <string>
++
++namespace libprojectM {
++namespace MilkdropPreset {
++
++using libprojectM::MilkdropPreset::MilkdropStaticShaders;
++
++std::string AssembleApplyPreprocessorInput(MilkdropShader::ShaderType type,
++                                           const std::string& presetShaderBody)
++{
++    // RoonVis local patch: byte-for-byte extraction of the pure-text assembly that used to
++    // live inline in MilkdropShader::PreprocessPresetShader. Do NOT alter any transformation,
++    // ordering, whitespace, header or #define content — a host tool and the runtime rely on
++    // producing identical bytes.
++    std::string program = presetShaderBody;
++
++    std::string shaderTypeString = "composite";
++    if (type == MilkdropShader::ShaderType::WarpShader)
++    {
++        shaderTypeString = "warp";
++    }
++
++    if (program.length() <= 0)
++    {
++        throw Renderer::ShaderException("[MilkdropShader] Preset " + shaderTypeString + " shader is declared, but empty.");
++    }
++
++    size_t found;
++
++    // Find "sampler_state" overrides and remove them first, as they're not supported by GLSL.
++    // The logic isn't totally fool-proof, but should work in general.
++    // Use a comment-stripped copy for searching so commented-out sampler_state blocks are skipped.
++    // StripComments preserves string length, so positions map 1:1 to the original.
++    std::string stripped = Utils::StripComments(program);
++    found = stripped.find("sampler_state");
++    while (found != std::string::npos)
++    {
++        // Now go backwards and find the assignment
++        found = stripped.rfind('=', found);
++        auto startPos = found;
++
++        // Find closing brace and semicolon
++        found = stripped.find('}', found);
++        found = stripped.find(';', found);
++
++        if (found != std::string::npos)
++        {
++            stripped.replace(startPos, found - startPos, "");
++        }
++        else
++        {
++            // No closing brace and semicolon.
++            break;
++        }
++
++        found = stripped.find("sampler_state");
++    }
++
++    // replace shader_body with entry point function
++    // Use the stripped copy so a commented-out shader_body is not matched.
++    found = stripped.find("shader_body");
++    if (found != std::string::npos)
++    {
++        if (type == MilkdropShader::ShaderType::WarpShader)
++        {
++            program.replace(int(found), 11, R"(
++void PS(float4 _vDiffuse : COLOR,
++        float4 _uv : TEXCOORD0,
++        float2 _rad_ang : TEXCOORD1,
++        out float4 _return_value : COLOR0,
++        out float4 _mv_tex_coords : COLOR1)
++)");
++        }
++        else
++        {
++            program.replace(int(found), 11, R"(
++void PS(float4 _vDiffuse : COLOR,
++        float2 _uv : TEXCOORD0,
++        float2 _rad_ang : TEXCOORD1,
++        out float4 _return_value : COLOR)
++)");
++        }
++    }
++    else
++    {
++        LOG_DEBUG("[MilkdropShader] Failed " + shaderTypeString + " shader code:\n" + program);
++        throw Renderer::ShaderException("[MilkdropShader] Preset " + shaderTypeString + " shader is missing \"shader_body\" entry point.");
++    }
++
++    // replace the "{" immediately following shader_body with some variable declarations
++    found = program.find('{', found);
++    if (found != std::string::npos)
++    {
++        std::string progMain = "{\nfloat3 ret = 0;\n";
++        if (type == MilkdropShader::ShaderType::WarpShader)
++        {
++            progMain.append("_mv_tex_coords.xy = _uv.xy;\n");
++        }
++        program.replace(int(found), 1, progMain);
++    }
++    else
++    {
++        LOG_DEBUG("[MilkdropShader] Failed " + shaderTypeString + " shader code:\n" + program);
++        throw Renderer::ShaderException("[MilkdropShader] Preset " + shaderTypeString + " shader has no opening braces.");
++    }
++
++    // replace "}" with return statement (this can probably be optimized for the GLSL conversion...)
++    found = program.rfind('}');
++    if (found != std::string::npos)
++    {
++        program.replace(int(found), 1, "_return_value = float4(ret.xyz, 1.0);\n"
++                                       "}\n");
++    }
++    else
++    {
++        LOG_DEBUG("[MilkdropShader] Failed " + shaderTypeString + " shader code:\n" + program);
++        throw Renderer::ShaderException("[MilkdropShader] Preset " + shaderTypeString + " shader has no closing brace.");
++    }
++
++    // Find matching closing brace and cut off excess text after shader's main function
++    int bracesOpen = 1;
++    size_t pos = found + 1;
++    for (; pos < program.length() && bracesOpen > 0; ++pos)
++    {
++        switch (program.at(pos))
++        {
++            case '/':
++                // Skip line comments until EoL to prevent false counting
++                if (pos < program.length() - 1 && program.at(pos + 1) == '/')
++                {
++                    for (; pos < program.length(); ++pos)
++                    {
++                        if (program.at(pos) == '\n')
++                        {
++                            break;
++                        }
++                    }
++                }
++                // Skip block comments to prevent false counting
++                else if (pos < program.length() - 1 && program.at(pos + 1) == '*')
++                {
++                    pos += 2;
++                    for (; pos < program.length() - 1; ++pos)
++                    {
++                        if (program.at(pos) == '*' && program.at(pos + 1) == '/')
++                        {
++                            ++pos; // skip past '/'
++                            break;
++                        }
++                    }
++                }
++                continue;
++
++            case '{':
++                bracesOpen++;
++                continue;
++
++            case '}':
++                bracesOpen--;
++        }
++    }
++
++    if (pos < program.length() - 1)
++    {
++        program.resize(pos);
++    }
++
++    std::string fullSource; //!< Full shader source before translation, includes all uniforms etc.
++
++    // First copy the generic "header" into the shader. Includes uniforms and some defines
++    // to unwrap the packed 4-element uniforms into single values.
++    fullSource.append(MilkdropStaticShaders::Get()->GetPresetShaderHeader());
++
++    if (type == MilkdropShader::ShaderType::WarpShader)
++    {
++        fullSource.append("#define rad _rad_ang.x\n"
++                          "#define ang _rad_ang.y\n"
++                          "#define uv _uv.xy\n"
++                          "#define uv_orig _uv.zw\n");
++    }
++    else
++    {
++        fullSource.append("#define rad _rad_ang.x\n"
++                          "#define ang _rad_ang.y\n"
++                          "#define uv _uv.xy\n"
++                          "#define uv_orig _uv.xy\n"
++                          "#define hue_shader _vDiffuse.xyz\n");
++    }
++
++    fullSource.append(program);
++
++    return fullSource;
++}
++
++namespace {
++
++// Compile-time salt. Bump this string whenever anything that changes the produced GLSL for
++// a given input changes: the static preset shader header, the hlslparser/ApplyPreprocessor
++// implementation, or AssembleApplyPreprocessorInput above. Bumping invalidates every stale
++// cache entry (old keys can no longer be produced).
++constexpr const char* kPreprocessCacheSalt = "pmpp-v1:";
++
++uint64_t Fnv1a64(const std::string& data, uint64_t offsetBasis)
++{
++    constexpr uint64_t prime = 1099511628211ull;
++    uint64_t hash = offsetBasis;
++    for (const char c : data)
++    {
++        hash ^= static_cast<uint64_t>(static_cast<unsigned char>(c));
++        hash *= prime;
++    }
++    return hash;
++}
++
++} // namespace
++
++std::string ComputePreprocessCacheKey(const std::string& applyPreprocessorInput)
++{
++    // Two independent FNV-1a passes with different offset bases (the second is the standard
++    // basis byte-reversed) give ~128 bits of effective hash; the length is embedded too.
++    const uint64_t h1 = Fnv1a64(applyPreprocessorInput, 14695981039346656037ull);
++    const uint64_t h2 = Fnv1a64(applyPreprocessorInput, 0x84222325cbf29ce4ull);
++
++    char buffer[64];
++    std::snprintf(buffer, sizeof(buffer), "%016llx%016llx-%zx",
++                  static_cast<unsigned long long>(h1),
++                  static_cast<unsigned long long>(h2),
++                  applyPreprocessorInput.size());
++
++    return std::string(kPreprocessCacheSalt) + buffer;
++}
++
++std::string PreprocessCacheSalt()
++{
++    return kPreprocessCacheSalt;
++}
++
++} // namespace MilkdropPreset
++} // namespace libprojectM
+diff --git a/src/libprojectM/MilkdropPreset/MilkdropShaderPreprocess.hpp b/src/libprojectM/MilkdropPreset/MilkdropShaderPreprocess.hpp
+new file mode 100644
+index 000000000..d1b93d6a1
+--- /dev/null
++++ b/src/libprojectM/MilkdropPreset/MilkdropShaderPreprocess.hpp
+@@ -0,0 +1,74 @@
++/**
++ * @file MilkdropShaderPreprocess.hpp
++ * @brief GL-free, pure-text assembly of the input passed to the HLSL preprocessor.
++ *
++ * RoonVis local patch: extracted from MilkdropShader::PreprocessPresetShader so the exact
++ * string handed to HLSLParser::ApplyPreprocessor can be produced without a MilkdropShader
++ * instance, a GL context, textures, or PresetState. This is the shared foundation for a
++ * runtime shader-transpile cache and a build-time (host) precompute tool: both call this
++ * function and must get byte-identical output.
++ */
++#pragma once
++
++#include "MilkdropShader.hpp"
++
++#include <string>
++
++namespace libprojectM {
++namespace MilkdropPreset {
++
++/**
++ * @brief Assembles the pure-text shader source that is later passed to the HLSL
++ *        preprocessor (HLSLParser::ApplyPreprocessor).
++ *
++ * This is a pure function of (shader type, preset shader body): it renames the preset's
++ * shader entry point to PS(), strips unsupported sampler_state{} blocks, injects the
++ * per-type variable declarations, trims trailing text after the shader's main function,
++ * and prepends the static preset shader header plus the type-specific #defines. It does
++ * NOT touch GL, Renderer::Shader, textures, or PresetState.
++ *
++ * The output is byte-for-byte identical to what MilkdropShader::PreprocessPresetShader
++ * historically produced in-place.
++ *
++ * @param type The preset shader type (warp or composite).
++ * @param presetShaderBody The raw preset shader body (as loaded from the preset).
++ * @return The fully assembled shader source ready for the HLSL preprocessor.
++ * @throws Renderer::ShaderException If the body is empty or malformed (missing
++ *         "shader_body", opening brace, or closing brace) — same messages/type as before.
++ */
++std::string AssembleApplyPreprocessorInput(MilkdropShader::ShaderType type,
++                                           const std::string& presetShaderBody);
++
++/**
++ * @brief Computes a version-salted, collision-safe cache key for a preprocessed-HLSL
++ *        lookup, from the exact bytes handed to HLSLParser::ApplyPreprocessor.
++ *
++ * GL-free and side-effect-free, so the runtime transpile path and a future build-time
++ * precompute tool compute byte-identical keys for identical inputs.
++ *
++ * Collision safety: the key embeds a compile-time salt (bumped whenever the static shader
++ * header, the hlslparser, or the assembly transform changes — invalidating stale entries),
++ * the input length, and two independent 64-bit FNV-1a hashes seeded with different offset
++ * bases. That is ~128 bits of effective hash plus an exact length check, so accidental
++ * collisions are astronomically unlikely (and a length mismatch alone rules most out).
++ * The value stored under a key is deterministic text, so even in the impossible event of a
++ * full collision the only effect would be reusing a valid-but-wrong transpile — never a
++ * crash. Callers may treat a hit as authoritative.
++ *
++ * @param applyPreprocessorInput The exact string that would be passed to ApplyPreprocessor
++ *        (i.e. the return value of AssembleApplyPreprocessorInput).
++ * @return A printable ASCII cache key.
++ */
++std::string ComputePreprocessCacheKey(const std::string& applyPreprocessorInput);
++
++/**
++ * @brief Returns the compile-time version salt embedded in every cache key.
++ *
++ * Exposed so a build-time precompute tool can stamp the exact same salt into its resource
++ * header without duplicating the constant (the tool and ComputePreprocessCacheKey must not
++ * drift). Bumping the salt in the .cpp invalidates every stale precomputed/runtime entry.
++ */
++std::string PreprocessCacheSalt();
++
++} // namespace MilkdropPreset
++} // namespace libprojectM
+diff --git a/src/libprojectM/MilkdropPreset/PerFrameContext.cpp b/src/libprojectM/MilkdropPreset/PerFrameContext.cpp
+index b2063825b..23be83435 100644
+--- a/src/libprojectM/MilkdropPreset/PerFrameContext.cpp
++++ b/src/libprojectM/MilkdropPreset/PerFrameContext.cpp
+@@ -1,6 +1,7 @@
+ #include "PerFrameContext.hpp"
+ 
+ #include "MilkdropPresetExceptions.hpp"
++#include "PerPixelMesh.hpp" // RoonVis local patch: EvalProfiler load-split probe.
+ 
+ #include <Logging.hpp>
+ 
+@@ -121,7 +122,10 @@ void PerFrameContext::EvaluateInitCode(PresetState& state)
+         return;
+     }
+ 
++    // RoonVis local patch: load-split probe (see EvalProfiler in PerPixelMesh.hpp).
++    const auto evalCompileStartMs = EvalProfiler::LoadSplitNowMs();
+     auto* initCode = projectm_eval_code_compile(perFrameCodeContext, state.perFrameInitCode.c_str());
++    EvalProfiler::LoadSplitAddEvalCompile(evalCompileStartMs);
+     if (initCode == nullptr)
+     {
+         std::string error;
+@@ -242,7 +246,9 @@ void PerFrameContext::CompilePerFrameCode(const std::string& perFrameCode)
+         return;
+     }
+ 
++    const auto evalCompileStartMs = EvalProfiler::LoadSplitNowMs();
+     perFrameCodeHandle = projectm_eval_code_compile(perFrameCodeContext, perFrameCode.c_str());
++    EvalProfiler::LoadSplitAddEvalCompile(evalCompileStartMs);
+     if (perFrameCodeHandle == nullptr)
+     {
+         std::string error;
+diff --git a/src/libprojectM/MilkdropPreset/PerPixelContext.cpp b/src/libprojectM/MilkdropPreset/PerPixelContext.cpp
+index 2942a7f2f..c2d512328 100644
+--- a/src/libprojectM/MilkdropPreset/PerPixelContext.cpp
++++ b/src/libprojectM/MilkdropPreset/PerPixelContext.cpp
+@@ -2,6 +2,7 @@
+ 
+ #include "MilkdropPresetExceptions.hpp"
+ #include "PerFrameContext.hpp"
++#include "PerPixelMesh.hpp" // RoonVis local patch: EvalProfiler load-split probe.
+ 
+ #include <Logging.hpp>
+ 
+@@ -106,7 +107,10 @@ void PerPixelContext::CompilePerPixelCode(const std::string& perPixelCode)
+         return;
+     }
+ 
++    // RoonVis local patch: load-split probe (see EvalProfiler in PerPixelMesh.hpp).
++    const auto evalCompileStartMs = EvalProfiler::LoadSplitNowMs();
+     perPixelCodeHandle = projectm_eval_code_compile(perPixelCodeContext, perPixelCode.c_str());
++    EvalProfiler::LoadSplitAddEvalCompile(evalCompileStartMs);
+     if (perPixelCodeHandle == nullptr)
+     {
+         std::string error;
+diff --git a/src/libprojectM/MilkdropPreset/PerPixelMesh.cpp b/src/libprojectM/MilkdropPreset/PerPixelMesh.cpp
+index 0c4a7b9a1..bfd977596 100644
+--- a/src/libprojectM/MilkdropPreset/PerPixelMesh.cpp
++++ b/src/libprojectM/MilkdropPreset/PerPixelMesh.cpp
+@@ -11,11 +11,93 @@
+ #include <Renderer/ShaderCache.hpp>
+ 
+ #include <algorithm>
++#include <chrono>
+ #include <cmath>
++#include <cstdlib>
+ 
+ namespace libprojectM {
+ namespace MilkdropPreset {
+ 
++// RoonVis local patch: opt-in per-frame timing probes (see PerPixelMesh.hpp).
++namespace EvalProfiler {
++
++namespace {
++using Clock = std::chrono::steady_clock;
++
++WarpPassTimings lastWarpPassTimings;
++
++auto Milliseconds(Clock::time_point start, Clock::time_point end) -> double
++{
++    return std::chrono::duration<double, std::milli>(end - start).count();
++}
++} // namespace
++
++auto Enabled() -> bool
++{
++    static const bool enabled = [] {
++        const char* envValue = std::getenv("ROONVIS_PROJECTM_EVAL_PROFILE");
++        if (envValue == nullptr || envValue[0] == '\0')
++        {
++            envValue = std::getenv("PROJECTM_EVAL_PROFILE");
++        }
++        return envValue != nullptr && envValue[0] != '\0' && envValue[0] != '0';
++    }();
++    return enabled;
++}
++
++auto LastWarpPassTimings() -> const WarpPassTimings&
++{
++    return lastWarpPassTimings;
++}
++
++namespace {
++LoadSplitTimings loadSplitTimings;
++
++auto NowMilliseconds() -> double
++{
++    return std::chrono::duration<double, std::milli>(Clock::now().time_since_epoch()).count();
++}
++} // namespace
++
++auto LoadSplitNowMs() -> double
++{
++    if (!Enabled())
++    {
++        return 0.0;
++    }
++    return NowMilliseconds();
++}
++
++void LoadSplitAddEvalCompile(double startMs)
++{
++    if (!Enabled())
++    {
++        return;
++    }
++    loadSplitTimings.evalCompileMs += NowMilliseconds() - startMs;
++}
++
++void LoadSplitAddShaderCompile(double startMs)
++{
++    if (!Enabled())
++    {
++        return;
++    }
++    loadSplitTimings.shaderCompileMs += NowMilliseconds() - startMs;
++}
++
++void LoadSplitReset()
++{
++    loadSplitTimings = {};
++}
++
++auto LoadSplitTotals() -> const LoadSplitTimings&
++{
++    return loadSplitTimings;
++}
++
++} // namespace EvalProfiler
++
+ PerPixelMesh::PerPixelMesh()
+     : m_warpMesh(Renderer::VertexBufferUsage::StreamDraw)
+ {
+@@ -83,10 +165,41 @@ void PerPixelMesh::CompileWarpShader(PresetState& presetState)
+     }
+ }
+ 
++auto PerPixelMesh::WarpShaderCompileReady() const -> bool
++{
++    return !m_warpShader || m_warpShader->Shader().PendingCompileReady();
++}
++
++void PerPixelMesh::FinalizeWarpShaderCompile()
++{
++    if (m_warpShader && m_warpShader->Shader().HasPendingCompile())
++    {
++        try
++        {
++            m_warpShader->Shader().FinalizeCompile();
++            LOG_DEBUG("[PerPixelMesh] Successfully finalized deferred warp shader compile.");
++        }
++        catch (Renderer::ShaderException&)
++        {
++            // Same failure handling as CompileWarpShader: fall back to no warp shader.
++            LOG_ERROR("[PerPixelMesh] Error compiling warp shader code (deferred).");
++            m_warpShader.reset();
++        }
++    }
++}
++
+ void PerPixelMesh::Draw(const PresetState& presetState,
+                         const PerFrameContext& perFrameContext,
+                         PerPixelContext& perPixelContext)
+ {
++    // RoonVis local patch: reset the shared timing slot so a skipped draw doesn't
++    // leave stale values for MilkdropPreset::RenderFrame to accumulate.
++    const bool profile = EvalProfiler::Enabled();
++    if (profile)
++    {
++        EvalProfiler::lastWarpPassTimings = {};
++    }
++
+     if (presetState.renderContext.viewportSizeX == 0 ||
+         presetState.renderContext.viewportSizeY == 0 ||
+         presetState.renderContext.perPixelMeshX == 0 ||
+@@ -102,7 +215,12 @@ void PerPixelMesh::Draw(const PresetState& presetState,
+     CalculateMesh(presetState, perFrameContext, perPixelContext);
+ 
+     // Render the resulting mesh.
++    const auto blitStart = profile ? EvalProfiler::Clock::now() : EvalProfiler::Clock::time_point{};
+     WarpedBlit(presetState, perFrameContext);
++    if (profile)
++    {
++        EvalProfiler::lastWarpPassTimings.warpDrawMs += EvalProfiler::Milliseconds(blitStart, EvalProfiler::Clock::now());
++    }
+ }
+ 
+ void PerPixelMesh::InitializeMesh(const PresetState& presetState)
+@@ -213,6 +331,11 @@ void PerPixelMesh::CalculateMesh(const PresetState& presetState, const PerFrameC
+ 
+     int vertex = 0;
+ 
++    // RoonVis local patch: time the per-vertex expression evaluation loop separately
++    // from the vertex buffer uploads that follow it.
++    const bool profile = EvalProfiler::Enabled();
++    const auto evalStart = profile ? EvalProfiler::Clock::now() : EvalProfiler::Clock::time_point{};
++
+     // Can't make this multithreaded as per-pixel code may use gmegabuf or regXX vars.
+     auto& vertices = m_warpMesh.Vertices();
+     for (int y = 0; y <= m_gridSizeY; y++)
+@@ -272,12 +395,21 @@ void PerPixelMesh::CalculateMesh(const PresetState& presetState, const PerFrameC
+         }
+     }
+ 
++    const auto evalEnd = profile ? EvalProfiler::Clock::now() : EvalProfiler::Clock::time_point{};
++
+     m_warpMesh.Update();
+     m_radiusAngleBuffer.Update();
+     m_zoomRotWarpBuffer.Update();
+     m_centerBuffer.Update();
+     m_distanceBuffer.Update();
+     m_stretchBuffer.Update();
++
++    if (profile)
++    {
++        // Buffer uploads count towards the GL-submission (warp draw) bucket.
++        EvalProfiler::lastWarpPassTimings.vertexEvalMs = EvalProfiler::Milliseconds(evalStart, evalEnd);
++        EvalProfiler::lastWarpPassTimings.warpDrawMs += EvalProfiler::Milliseconds(evalEnd, EvalProfiler::Clock::now());
++    }
+ }
+ 
+ void PerPixelMesh::WarpedBlit(const PresetState& presetState,
+diff --git a/src/libprojectM/MilkdropPreset/PerPixelMesh.hpp b/src/libprojectM/MilkdropPreset/PerPixelMesh.hpp
+index dda77f114..b96294eb7 100644
+--- a/src/libprojectM/MilkdropPreset/PerPixelMesh.hpp
++++ b/src/libprojectM/MilkdropPreset/PerPixelMesh.hpp
+@@ -11,6 +11,55 @@ class PerFrameContext;
+ class PerPixelContext;
+ class MilkdropShader;
+ 
++/**
++ * RoonVis local patch: opt-in per-frame CPU/GPU-boundary timing probes, enabled via the
++ * ROONVIS_PROJECTM_EVAL_PROFILE environment variable (checked once, mirroring the
++ * transition profiler in ProjectM.cpp). Zero overhead when disabled: all clock calls are
++ * wrapped in Enabled() checks. Rendering is single-threaded (GL thread), so the shared
++ * "last warp pass" slot is a plain global written by PerPixelMesh::Draw and read back
++ * synchronously by MilkdropPreset::RenderFrame.
++ */
++namespace EvalProfiler {
++
++/// True if the eval profiler env variable is set (read once on first use).
++auto Enabled() -> bool;
++
++/// Timing split of the most recent PerPixelMesh::Draw call.
++struct WarpPassTimings {
++    double vertexEvalMs{}; //!< Per-vertex/per-pixel expression evaluation loop (CPU only).
++    double warpDrawMs{};   //!< Vertex buffer uploads + warp mesh GL submission.
++};
++
++/// Returns the timings recorded by the most recent PerPixelMesh::Draw call.
++auto LastWarpPassTimings() -> const WarpPassTimings&;
++
++/// Cumulative preset LOAD/INIT cost split ("ProjectMLoadSplit:" line, same env gate).
++/// Preset construction and Initialize() both run synchronously on the GL thread, so a
++/// plain global accumulator (like the warp-pass slot above) is safe: it is reset by
++/// MilkdropPreset::Initialize(), filled by the eval-compile and shader-compile probes
++/// below, and read back at the end of the same Initialize() call.
++struct LoadSplitTimings {
++    double evalCompileMs{};   //!< projectm-eval code compilation (per-frame init/per-frame/per-pixel + custom wave/shape code).
++    double shaderCompileMs{}; //!< MilkdropShader compile path (hlslparser translation + GL program compile/link), warp + composite.
++};
++
++/// Millisecond timestamp for the load-split probes; 0.0 (no clock call) when disabled.
++auto LoadSplitNowMs() -> double;
++
++/// Accumulates (now - startMs) into evalCompileMs. No-op when disabled.
++void LoadSplitAddEvalCompile(double startMs);
++
++/// Accumulates (now - startMs) into shaderCompileMs. No-op when disabled.
++void LoadSplitAddShaderCompile(double startMs);
++
++/// Resets the cumulative load-split timers (start of MilkdropPreset::Initialize).
++void LoadSplitReset();
++
++/// Returns the cumulative load-split timers.
++auto LoadSplitTotals() -> const LoadSplitTimings&;
++
++} // namespace EvalProfiler
++
+ /**
+  * @brief The "per-pixel" transformation mesh.
+  *
+@@ -41,6 +90,18 @@ public:
+      */
+     void CompileWarpShader(PresetState& presetState);
+ 
++    /**
++     * RoonVis local patch (Phase 3c): true once the warp shader's deferred background
++     * compile (if any) has finished. Non-blocking.
++     */
++    auto WarpShaderCompileReady() const -> bool;
++
++    /**
++     * RoonVis local patch (Phase 3c): finalizes a deferred warp-shader compile,
++     * replaying CompileWarpShader's failure handling (drop the warp shader).
++     */
++    void FinalizeWarpShaderCompile();
++
+     /**
+      * @brief Renders the transformation mesh.
+      * @param presetState The preset state to retrieve the configuration values from.
+diff --git a/src/libprojectM/MilkdropPreset/ShapePerFrameContext.cpp b/src/libprojectM/MilkdropPreset/ShapePerFrameContext.cpp
+index e31f5332d..1a2842b71 100644
+--- a/src/libprojectM/MilkdropPreset/ShapePerFrameContext.cpp
++++ b/src/libprojectM/MilkdropPreset/ShapePerFrameContext.cpp
+@@ -2,6 +2,7 @@
+ 
+ #include "CustomShape.hpp"
+ #include "MilkdropPresetExceptions.hpp"
++#include "PerPixelMesh.hpp" // RoonVis local patch: EvalProfiler load-split probe.
+ 
+ #include <Logging.hpp>
+ 
+@@ -140,7 +141,10 @@ void ShapePerFrameContext::EvaluateInitCode(const std::string& perFrameInitCode,
+         return;
+     }
+ 
++    // RoonVis local patch: load-split probe (see EvalProfiler in PerPixelMesh.hpp).
++    const auto evalCompileStartMs = EvalProfiler::LoadSplitNowMs();
+     auto* initCode = projectm_eval_code_compile(perFrameCodeContext, perFrameInitCode.c_str());
++    EvalProfiler::LoadSplitAddEvalCompile(evalCompileStartMs);
+     if (initCode == nullptr)
+     {
+         std::string error;
+@@ -175,7 +179,9 @@ void ShapePerFrameContext::CompilePerFrameCode(const std::string& perFrameCode,
+         return;
+     }
+ 
++    const auto evalCompileStartMs = EvalProfiler::LoadSplitNowMs();
+     perFrameCodeHandle = projectm_eval_code_compile(perFrameCodeContext, perFrameCode.c_str());
++    EvalProfiler::LoadSplitAddEvalCompile(evalCompileStartMs);
+     if (perFrameCodeHandle == nullptr)
+     {
+         std::string error;
+diff --git a/src/libprojectM/MilkdropPreset/WaveformPerFrameContext.cpp b/src/libprojectM/MilkdropPreset/WaveformPerFrameContext.cpp
+index c80a00647..513dc8b27 100644
+--- a/src/libprojectM/MilkdropPreset/WaveformPerFrameContext.cpp
++++ b/src/libprojectM/MilkdropPreset/WaveformPerFrameContext.cpp
+@@ -3,6 +3,7 @@
+ #include "CustomWaveform.hpp"
+ #include "MilkdropPresetExceptions.hpp"
+ #include "PerFrameContext.hpp"
++#include "PerPixelMesh.hpp" // RoonVis local patch: EvalProfiler load-split probe.
+ 
+ #include <Logging.hpp>
+ 
+@@ -102,7 +103,10 @@ void WaveformPerFrameContext::EvaluateInitCode(const std::string& perFrameInitCo
+         return;
+     }
+ 
++    // RoonVis local patch: load-split probe (see EvalProfiler in PerPixelMesh.hpp).
++    const auto evalCompileStartMs = EvalProfiler::LoadSplitNowMs();
+     auto* initCode = projectm_eval_code_compile(perFrameCodeContext, perFrameInitCode.c_str());
++    EvalProfiler::LoadSplitAddEvalCompile(evalCompileStartMs);
+     if (initCode == nullptr)
+     {
+         std::string error;
+@@ -137,7 +141,9 @@ void WaveformPerFrameContext::CompilePerFrameCode(const std::string& perFrameCod
+         return;
+     }
+ 
++    const auto evalCompileStartMs = EvalProfiler::LoadSplitNowMs();
+     perFrameCodeHandle = projectm_eval_code_compile(perFrameCodeContext, perFrameCode.c_str());
++    EvalProfiler::LoadSplitAddEvalCompile(evalCompileStartMs);
+     if (perFrameCodeHandle == nullptr)
+     {
+         std::string error;
+diff --git a/src/libprojectM/MilkdropPreset/WaveformPerPointContext.cpp b/src/libprojectM/MilkdropPreset/WaveformPerPointContext.cpp
+index e73fed4ae..a8de3a9bc 100644
+--- a/src/libprojectM/MilkdropPreset/WaveformPerPointContext.cpp
++++ b/src/libprojectM/MilkdropPreset/WaveformPerPointContext.cpp
+@@ -3,6 +3,7 @@
+ #include "CustomWaveform.hpp"
+ #include "MilkdropPresetExceptions.hpp"
+ #include "PerFrameContext.hpp"
++#include "PerPixelMesh.hpp" // RoonVis local patch: EvalProfiler load-split probe.
+ 
+ #include <Logging.hpp>
+ 
+@@ -90,7 +91,10 @@ void WaveformPerPointContext::CompilePerPointCode(const std::string& perPointCod
+         return;
+     }
+ 
++    // RoonVis local patch: load-split probe (see EvalProfiler in PerPixelMesh.hpp).
++    const auto evalCompileStartMs = EvalProfiler::LoadSplitNowMs();
+     perPointCodeHandle = projectm_eval_code_compile(perPointCodeContext, perPointCode.c_str());
++    EvalProfiler::LoadSplitAddEvalCompile(evalCompileStartMs);
+     if (perPointCodeHandle == nullptr)
+     {
+         std::string error;
+diff --git a/src/libprojectM/Preset.hpp b/src/libprojectM/Preset.hpp
+index c96b1bf7f..2b8772ea8 100644
+--- a/src/libprojectM/Preset.hpp
++++ b/src/libprojectM/Preset.hpp
+@@ -60,6 +60,23 @@ public:
+      */
+     virtual void BindFramebuffer() = 0;
+ 
++    /**
++     * RoonVis local patch (Phase 3c): non-blocking — true once any deferred background
++     * shader compiles started during Initialize() have finished (or if the preset has
++     * none). Default: nothing deferred.
++     */
++    virtual auto PendingShaderCompileReady() const -> bool
++    {
++        return true;
++    }
++
++    /**
++     * RoonVis local patch (Phase 3c): finalizes deferred shader compiles (status check +
++     * cleanup + per-shader failure fallback). Blocks if a compile is still running —
++     * callers should gate on PendingShaderCompileReady(). Default: no-op.
++     */
++    virtual void FinalizePendingShaderCompile() {}
++
+     inline void SetFilename(const std::string& filename)
+     {
+         m_filename = filename;
+diff --git a/src/libprojectM/ProjectM.cpp b/src/libprojectM/ProjectM.cpp
+index a042f244c..05886726e 100644
+--- a/src/libprojectM/ProjectM.cpp
++++ b/src/libprojectM/ProjectM.cpp
+@@ -30,13 +30,47 @@
+ 
+ #include <Renderer/CopyTexture.hpp>
+ #include <Renderer/PresetTransition.hpp>
++#include <Renderer/Shader.hpp>
+ #include <Renderer/ShaderCache.hpp>
+ #include <Renderer/TextureManager.hpp>
+ #include <Renderer/TransitionShaderManager.hpp>
+ 
+ #include <UserSprites/SpriteManager.hpp>
+ 
++#include <chrono>
++#include <cstdlib>
++#include <iomanip>
++#include <sstream>
++
+ namespace libprojectM {
++namespace {
++
++using ProfileClock = std::chrono::steady_clock;
++
++auto TransitionProfileEnabled() -> bool
++{
++    static const bool enabled = [] {
++        const char* envValue = std::getenv("ROONVIS_PROJECTM_TRANSITION_PROFILE");
++        if (envValue == nullptr || envValue[0] == '\0')
++        {
++            envValue = std::getenv("PROJECTM_TRANSITION_PROFILE");
++        }
++        return envValue != nullptr && envValue[0] != '\0' && envValue[0] != '0';
++    }();
++    return enabled;
++}
++
++auto ProfileMilliseconds(ProfileClock::time_point start, ProfileClock::time_point end) -> double
++{
++    return std::chrono::duration<double, std::milli>(end - start).count();
++}
++
++void LogProfileLine(const std::string& line)
++{
++    LOG_INFO(line);
++}
++
++} // namespace
+ 
+ ProjectM::ProjectM()
+     : m_presetFactoryManager(std::make_unique<PresetFactoryManager>())
+@@ -61,22 +95,188 @@ void ProjectM::LoadPresetFile(const std::string& presetFilename, bool smoothTran
+ {
+     try
+     {
++        const bool profile = TransitionProfileEnabled();
++        const auto totalStart = ProfileClock::now();
+         m_textureManager->PurgeTextures();
+-        StartPresetTransition(m_presetFactoryManager->CreatePresetFromFile(presetFilename), !smoothTransition);
++        const auto createStart = ProfileClock::now();
++        auto preset = m_presetFactoryManager->CreatePresetFromFile(presetFilename);
++        const auto createEnd = ProfileClock::now();
++        StartPresetTransition(std::move(preset), !smoothTransition);
++        const auto totalEnd = ProfileClock::now();
++        if (profile)
++        {
++            std::ostringstream line;
++            line << std::fixed << std::setprecision(3)
++                 << "ProjectMTransitionLoadProfile:"
++                 << " smooth=" << (smoothTransition ? 1 : 0)
++                 << " create_ms=" << ProfileMilliseconds(createStart, createEnd)
++                 << " start_ms=" << ProfileMilliseconds(createEnd, totalEnd)
++                 << " total_ms=" << ProfileMilliseconds(totalStart, totalEnd)
++                 << " preset=\"" << presetFilename << "\"";
++            LogProfileLine(line.str());
++        }
++    }
++    catch (const std::exception& ex)
++    {
++        LOG_ERROR(ex.what());
++        PresetSwitchFailedEvent(presetFilename, ex.what());
++    }
++}
++
++void ProjectM::PreloadPresetFile(const std::string& presetFilename)
++{
++    try
++    {
++        const bool profile = TransitionProfileEnabled();
++        const auto totalStart = ProfileClock::now();
++        const auto createStart = ProfileClock::now();
++        auto preset = m_presetFactoryManager->CreatePresetFromFile(presetFilename);
++        const auto createEnd = ProfileClock::now();
++        const auto initializeStart = ProfileClock::now();
++        {
++            // RoonVis local patch (Phase 3c): preload-scoped deferred GL compile. Shader
++            // compiles started during Initialize() run on ANGLE's worker pool; the
++            // status checks + cleanup happen in FinalizePendingShaderCompile() once
++            // PreloadedPresetCompileReady() reports the background work done.
++            struct DeferGuard
++            {
++                DeferGuard() { Renderer::Shader::SetDeferCompilation(true); }
++                ~DeferGuard() { Renderer::Shader::SetDeferCompilation(false); }
++            } deferGuard;
++            preset->Initialize(GetRenderContext());
++        }
++        const auto initializeEnd = ProfileClock::now();
++
++        m_preloadedPreset = std::move(preset);
++        m_preloadedPresetName = presetFilename;
++        m_preloadedPresetWindowWidth = m_windowWidth;
++        m_preloadedPresetWindowHeight = m_windowHeight;
++
++        if (profile)
++        {
++            std::ostringstream line;
++            line << std::fixed << std::setprecision(3)
++                 << "ProjectMPreloadProfile:"
++                 << " create_ms=" << ProfileMilliseconds(createStart, createEnd)
++                 << " initialize_ms=" << ProfileMilliseconds(initializeStart, initializeEnd)
++                 << " total_ms=" << ProfileMilliseconds(totalStart, initializeEnd)
++                 << " preset=\"" << presetFilename << "\"";
++            LogProfileLine(line.str());
++        }
+     }
+     catch (const std::exception& ex)
+     {
++        m_preloadedPreset.reset();
++        m_preloadedPresetName.clear();
++        m_preloadedPresetWindowWidth = 0;
++        m_preloadedPresetWindowHeight = 0;
+         LOG_ERROR(ex.what());
+         PresetSwitchFailedEvent(presetFilename, ex.what());
+     }
+ }
+ 
++auto ProjectM::ActivatePreloadedPreset(bool smoothTransition) -> bool
++{
++    if (m_preloadedPreset == nullptr)
++    {
++        return false;
++    }
++
++    if (m_preloadedPresetWindowWidth != m_windowWidth || m_preloadedPresetWindowHeight != m_windowHeight)
++    {
++        // Preset::Initialize() bakes the current render context into GL resources. If the
++        // surface changed after preload, discard the prepared preset and let the caller
++        // fall back to the normal load path for the new size.
++        m_preloadedPreset.reset();
++        m_preloadedPresetName.clear();
++        m_preloadedPresetWindowWidth = 0;
++        m_preloadedPresetWindowHeight = 0;
++        return false;
++    }
++
++    // RoonVis local patch (Phase 3c): settle any deferred background shader compiles
++    // before handing the preset to the transition. Callers gate activation on
++    // PreloadedPresetCompileReady(), so this is normally an instant resolve; if a
++    // compile is genuinely still running it blocks here (correctness over smoothness).
++    // Per-shader failures fall back inside FinalizePendingShaderCompile; anything that
++    // still escapes discards the preload so the caller does a normal load instead.
++    try
++    {
++        const bool profile = TransitionProfileEnabled();
++        const auto finalizeStart = ProfileClock::now();
++        m_preloadedPreset->FinalizePendingShaderCompile();
++        if (profile)
++        {
++            std::ostringstream line;
++            line << std::fixed << std::setprecision(3)
++                 << "ProjectMPreloadFinalize:"
++                 << " finalize_ms=" << ProfileMilliseconds(finalizeStart, ProfileClock::now())
++                 << " preset=\"" << m_preloadedPresetName << "\"";
++            LogProfileLine(line.str());
++        }
++    }
++    catch (const std::exception& ex)
++    {
++        LOG_ERROR(ex.what());
++        PresetSwitchFailedEvent(m_preloadedPresetName, ex.what());
++        m_preloadedPreset.reset();
++        m_preloadedPresetName.clear();
++        m_preloadedPresetWindowWidth = 0;
++        m_preloadedPresetWindowHeight = 0;
++        return false;
++    }
++
++    // Purge at handoff rather than preload: PurgeTextures() deliberately ages textures
++    // once per real preset load and may evict cache entries. Preloading happens while the
++    // active preset is still rendering, so aging early would count a speculative load as
++    // an active switch and could evict reusable textures before the handoff.
++    m_textureManager->PurgeTextures();
++    StartPresetTransitionInternal(std::move(m_preloadedPreset), !smoothTransition, true);
++    m_preloadedPresetName.clear();
++    m_preloadedPresetWindowWidth = 0;
++    m_preloadedPresetWindowHeight = 0;
++    return true;
++}
++
++auto ProjectM::HasPreloadedPreset() const -> bool
++{
++    return m_preloadedPreset != nullptr;
++}
++
++auto ProjectM::PreloadedPresetCompileReady() const -> bool
++{
++    return m_preloadedPreset != nullptr && m_preloadedPreset->PendingShaderCompileReady();
++}
++
++auto ProjectM::PreloadedPresetName() const -> const std::string&
++{
++    return m_preloadedPresetName;
++}
++
+ void ProjectM::LoadPresetData(std::istream& presetData, bool smoothTransition)
+ {
+     try
+     {
++        const bool profile = TransitionProfileEnabled();
++        const auto totalStart = ProfileClock::now();
+         m_textureManager->PurgeTextures();
+-        StartPresetTransition(m_presetFactoryManager->CreatePresetFromStream(".milk", presetData), !smoothTransition);
++        const auto createStart = ProfileClock::now();
++        auto preset = m_presetFactoryManager->CreatePresetFromStream(".milk", presetData);
++        const auto createEnd = ProfileClock::now();
++        StartPresetTransition(std::move(preset), !smoothTransition);
++        const auto totalEnd = ProfileClock::now();
++        if (profile)
++        {
++            std::ostringstream line;
++            line << std::fixed << std::setprecision(3)
++                 << "ProjectMTransitionLoadProfile:"
++                 << " smooth=" << (smoothTransition ? 1 : 0)
++                 << " create_ms=" << ProfileMilliseconds(createStart, createEnd)
++                 << " start_ms=" << ProfileMilliseconds(createEnd, totalEnd)
++                 << " total_ms=" << ProfileMilliseconds(totalStart, totalEnd)
++                 << " preset=\"(stream)\"";
++            LogProfileLine(line.str());
++        }
+     }
+     catch (const std::exception& ex)
+     {
+@@ -115,6 +315,15 @@ void ProjectM::SetTextureLoadCallback(Renderer::TextureLoadCallback callback)
+ 
+ void ProjectM::RenderFrame(uint32_t targetFramebufferObject /*= 0*/)
+ {
++    const bool profileTransition = TransitionProfileEnabled();
++    const auto frameProfileStart = profileTransition ? ProfileClock::now() : ProfileClock::time_point{};
++    double transitionProgress = 0.0;
++    bool profiledTransitionFrame = false;
++    double profileTransitioningPresetRenderMs = 0.0;
++    double profileActivePresetRenderMs = 0.0;
++    double profileCompositeMs = 0.0;
++    double profileSpriteMs = 0.0;
++
+     // Don't render if window area is zero.
+     if (m_windowWidth == 0 || m_windowHeight == 0)
+     {
+@@ -173,6 +382,8 @@ void ProjectM::RenderFrame(uint32_t targetFramebufferObject /*= 0*/)
+ 
+     if (m_transition != nullptr && m_transitioningPreset != nullptr)
+     {
++        profiledTransitionFrame = profileTransition;
++        transitionProgress = m_transition->Progress(m_timeKeeper->GetFrameTime());
+         if (m_transition->IsDone(m_timeKeeper->GetFrameTime()))
+         {
+             m_activePreset = std::move(m_transitioningPreset);
+@@ -181,13 +392,23 @@ void ProjectM::RenderFrame(uint32_t targetFramebufferObject /*= 0*/)
+         }
+         else
+         {
++            const auto renderStart = profileTransition ? ProfileClock::now() : ProfileClock::time_point{};
+             m_transitioningPreset->RenderFrame(audioData, renderContext);
++            if (profileTransition)
++            {
++                profileTransitioningPresetRenderMs = ProfileMilliseconds(renderStart, ProfileClock::now());
++            }
+         }
+     }
+ 
+ 
+     // ToDo: Call the to-be-implemented render method in Renderer
++    const auto activeRenderStart = profileTransition ? ProfileClock::now() : ProfileClock::time_point{};
+     m_activePreset->RenderFrame(audioData, renderContext);
++    if (profileTransition && profiledTransitionFrame)
++    {
++        profileActivePresetRenderMs = ProfileMilliseconds(activeRenderStart, ProfileClock::now());
++    }
+ 
+     glBindFramebuffer(GL_DRAW_FRAMEBUFFER, static_cast<GLuint>(targetFramebufferObject));
+     glViewport(0, 0, renderContext.viewportSizeX, renderContext.viewportSizeY);
+@@ -205,7 +426,12 @@ void ProjectM::RenderFrame(uint32_t targetFramebufferObject /*= 0*/)
+ 
+     if (m_transition != nullptr && m_transitioningPreset != nullptr)
+     {
++        const auto compositeStart = profileTransition ? ProfileClock::now() : ProfileClock::time_point{};
+         m_transition->Draw(*m_activePreset, *m_transitioningPreset, renderContext, audioData, m_timeKeeper->GetFrameTime());
++        if (profileTransition && profiledTransitionFrame)
++        {
++            profileCompositeMs = ProfileMilliseconds(compositeStart, ProfileClock::now());
++        }
+     }
+     else
+     {
+@@ -213,7 +439,24 @@ void ProjectM::RenderFrame(uint32_t targetFramebufferObject /*= 0*/)
+     }
+ 
+     // Draw user sprites
++    const auto spriteStart = profileTransition ? ProfileClock::now() : ProfileClock::time_point{};
+     m_spriteManager->Draw(audioData, renderContext, targetFramebufferObject, {m_activePreset, m_transitioningPreset});
++    if (profileTransition && profiledTransitionFrame)
++    {
++        profileSpriteMs = ProfileMilliseconds(spriteStart, ProfileClock::now());
++        const auto frameProfileEnd = ProfileClock::now();
++        std::ostringstream line;
++        line << std::fixed << std::setprecision(3)
++             << "ProjectMTransitionFrameProfile:"
++             << " frame=" << m_frameCount
++             << " progress=" << transitionProgress
++             << " new_render_ms=" << profileTransitioningPresetRenderMs
++             << " active_render_ms=" << profileActivePresetRenderMs
++             << " composite_ms=" << profileCompositeMs
++             << " sprite_ms=" << profileSpriteMs
++             << " total_ms=" << ProfileMilliseconds(frameProfileStart, frameProfileEnd);
++        LogProfileLine(line.str());
++    }
+ 
+     m_frameCount++;
+     m_previousFrameVolume = audioData.vol;
+@@ -287,6 +530,16 @@ void ProjectM::SetWindowSize(uint32_t width, uint32_t height)
+ 
+ void ProjectM::StartPresetTransition(std::unique_ptr<Preset>&& preset, bool hardCut)
+ {
++    StartPresetTransitionInternal(std::move(preset), hardCut, false);
++}
++
++void ProjectM::StartPresetTransitionInternal(std::unique_ptr<Preset>&& preset, bool hardCut, bool alreadyInitialized)
++{
++    const bool profile = TransitionProfileEnabled();
++    const auto totalStart = profile ? ProfileClock::now() : ProfileClock::time_point{};
++    double initializeMs = 0.0;
++    double initialImageMs = 0.0;
++    double transitionSetupMs = 0.0;
+     m_presetChangeNotified = m_presetLocked;
+ 
+     if (preset == nullptr)
+@@ -294,7 +547,15 @@ void ProjectM::StartPresetTransition(std::unique_ptr<Preset>&& preset, bool hard
+         return;
+     }
+ 
+-    preset->Initialize(GetRenderContext());
++    if (!alreadyInitialized)
++    {
++        const auto initializeStart = profile ? ProfileClock::now() : ProfileClock::time_point{};
++        preset->Initialize(GetRenderContext());
++        if (profile)
++        {
++            initializeMs = ProfileMilliseconds(initializeStart, ProfileClock::now());
++        }
++    }
+ 
+     // If already in a transition, force immediate completion.
+     if (m_transitioningPreset != nullptr)
+@@ -305,7 +566,12 @@ void ProjectM::StartPresetTransition(std::unique_ptr<Preset>&& preset, bool hard
+ 
+     if (m_activePreset && !m_presetStartClean)
+     {
++        const auto initialImageStart = profile ? ProfileClock::now() : ProfileClock::time_point{};
+         preset->DrawInitialImage(m_activePreset->OutputTexture(), GetRenderContext());
++        if (profile)
++        {
++            initialImageMs = ProfileMilliseconds(initialImageStart, ProfileClock::now());
++        }
+     }
+ 
+     if (hardCut)
+@@ -317,7 +583,25 @@ void ProjectM::StartPresetTransition(std::unique_ptr<Preset>&& preset, bool hard
+     {
+         m_transitioningPreset = std::move(preset);
+         m_timeKeeper->StartSmoothing();
++        const auto transitionSetupStart = profile ? ProfileClock::now() : ProfileClock::time_point{};
+         m_transition = std::make_unique<Renderer::PresetTransition>(m_transitionShaderManager->RandomTransition(), m_softCutDuration, m_timeKeeper->GetFrameTime());
++        if (profile)
++        {
++            transitionSetupMs = ProfileMilliseconds(transitionSetupStart, ProfileClock::now());
++        }
++    }
++
++    if (profile)
++    {
++        std::ostringstream line;
++        line << std::fixed << std::setprecision(3)
++             << "ProjectMTransitionStartProfile:"
++             << " hard_cut=" << (hardCut ? 1 : 0)
++             << " initialize_ms=" << initializeMs
++             << " initial_image_ms=" << initialImageMs
++             << " transition_setup_ms=" << transitionSetupMs
++             << " total_ms=" << ProfileMilliseconds(totalStart, ProfileClock::now());
++        LogProfileLine(line.str());
+     }
+ }
+ 
+@@ -573,6 +857,20 @@ void ProjectM::TouchDestroyAll()
+     // UNIMPLEMENTED
+ }
+ 
++void ProjectM::SetPreprocessCacheHooks(const projectm_preprocess_cache_hooks* hooks)
++{
++    if (hooks != nullptr)
++    {
++        m_preprocessCacheHooks = *hooks;
++        m_preprocessCacheHooksSet = true;
++    }
++    else
++    {
++        m_preprocessCacheHooks = projectm_preprocess_cache_hooks{};
++        m_preprocessCacheHooksSet = false;
++    }
++}
++
+ auto ProjectM::GetRenderContext() -> Renderer::RenderContext
+ {
+     Renderer::RenderContext ctx{};
+@@ -595,6 +893,7 @@ auto ProjectM::GetRenderContext() -> Renderer::RenderContext
+ 
+     ctx.textureManager = m_textureManager.get();
+     ctx.shaderCache = m_shaderCache.get();
++    ctx.preprocessCache = m_preprocessCacheHooksSet ? &m_preprocessCacheHooks : nullptr;
+ 
+     if (m_transition)
+     {
+diff --git a/src/libprojectM/ProjectM.hpp b/src/libprojectM/ProjectM.hpp
+index 9879e77f0..83f10ffe6 100644
+--- a/src/libprojectM/ProjectM.hpp
++++ b/src/libprojectM/ProjectM.hpp
+@@ -89,6 +89,20 @@ public:
+      */
+     void LoadPresetFile(const std::string& presetFilename, bool smoothTransition);
+ 
++    void PreloadPresetFile(const std::string& presetFilename);
++
++    auto ActivatePreloadedPreset(bool smoothTransition) -> bool;
++
++    auto HasPreloadedPreset() const -> bool;
++
++    /**
++     * RoonVis local patch (Phase 3c): non-blocking — true once the preloaded preset's
++     * deferred background shader compiles have finished. False if no preset is preloaded.
++     */
++    auto PreloadedPresetCompileReady() const -> bool;
++
++    auto PreloadedPresetName() const -> const std::string&;
++
+     /**
+      * @brief Loads the given preset data and performs a smooth or immediate transition.
+      *
+@@ -281,6 +295,14 @@ public:
+      */
+     void BurnInTexture(uint32_t openGlTextureId, int left, int top, int width, int height);
+ 
++    /**
++     * @brief Registers (or clears) app-provided preprocessed-HLSL cache hooks.
++     *
++     * The struct is copied by value. Passing nullptr clears any registered hooks.
++     * @param hooks Pointer to the hooks struct, or nullptr to clear.
++     */
++    void SetPreprocessCacheHooks(const projectm_preprocess_cache_hooks* hooks);
++
+ private:
+     void Initialize();
+ 
+@@ -288,6 +310,8 @@ private:
+ 
+     void StartPresetTransition(std::unique_ptr<Preset>&& preset, bool hardCut);
+ 
++    void StartPresetTransitionInternal(std::unique_ptr<Preset>&& preset, bool hardCut, bool alreadyInitialized);
++
+     void LoadIdlePreset();
+ 
+     auto GetRenderContext() -> Renderer::RenderContext;
+@@ -328,9 +352,16 @@ private:
+     std::unique_ptr<Renderer::CopyTexture> m_textureCopier;                       //!< Class that copies textures 1:1 to another texture or framebuffer.
+     std::unique_ptr<Preset> m_activePreset;                                       //!< Currently loaded preset.
+     std::unique_ptr<Preset> m_transitioningPreset;                                //!< Destination preset when smooth preset switching.
++    std::unique_ptr<Preset> m_preloadedPreset;                                    //!< Initialized next preset retained for low-latency switching.
++    std::string m_preloadedPresetName;                                            //!< Filename used to create the preloaded preset.
++    uint32_t m_preloadedPresetWindowWidth{0};                                     //!< Window width used during preloaded preset initialization.
++    uint32_t m_preloadedPresetWindowHeight{0};                                    //!< Window height used during preloaded preset initialization.
+     std::unique_ptr<Renderer::PresetTransition> m_transition;                     //!< Transition effect used for blending.
+     std::unique_ptr<TimeKeeper> m_timeKeeper;                                     //!< Keeps the different timers used to render and switch presets.
+     std::unique_ptr<UserSprites::SpriteManager> m_spriteManager;                  //!< Manages all types of user sprites.
++
++    projectm_preprocess_cache_hooks m_preprocessCacheHooks{}; //!< App-provided preprocessed-HLSL cache hooks (copied by value).
++    bool m_preprocessCacheHooksSet{false};                    //!< True once hooks are registered; controls RenderContext propagation.
+ };
+ 
+ } // namespace libprojectM
+diff --git a/src/libprojectM/ProjectMCWrapper.cpp b/src/libprojectM/ProjectMCWrapper.cpp
+index cd2bca2f2..3af4ab131 100644
+--- a/src/libprojectM/ProjectMCWrapper.cpp
++++ b/src/libprojectM/ProjectMCWrapper.cpp
+@@ -114,6 +114,30 @@ void projectm_load_preset_file(projectm_handle instance, const char* filename,
+     projectMInstance->LoadPresetFile(filename, smooth_transition);
+ }
+ 
++void projectm_preload_preset_file(projectm_handle instance, const char* filename)
++{
++    auto projectMInstance = handle_to_instance(instance);
++    projectMInstance->PreloadPresetFile(filename);
++}
++
++bool projectm_activate_preloaded_preset(projectm_handle instance, bool smooth_transition)
++{
++    auto projectMInstance = handle_to_instance(instance);
++    return projectMInstance->ActivatePreloadedPreset(smooth_transition);
++}
++
++bool projectm_has_preloaded_preset(projectm_handle instance)
++{
++    auto projectMInstance = handle_to_instance(instance);
++    return projectMInstance->HasPreloadedPreset();
++}
++
++bool projectm_preloaded_preset_compile_ready(projectm_handle instance)
++{
++    auto projectMInstance = handle_to_instance(instance);
++    return projectMInstance->PreloadedPresetCompileReady();
++}
++
+ void projectm_load_preset_data(projectm_handle instance, const char* data,
+                                bool smooth_transition)
+ {
+@@ -171,6 +195,13 @@ void projectm_set_texture_load_event_callback(projectm_handle instance,
+     }
+ }
+ 
++void projectm_set_preprocess_cache(projectm_handle instance,
++                                   const projectm_preprocess_cache_hooks* hooks)
++{
++    auto projectMInstance = handle_to_instance(instance);
++    projectMInstance->SetPreprocessCacheHooks(hooks);
++}
++
+ void projectm_set_texture_search_paths(projectm_handle instance,
+                                        const char** texture_search_paths,
+                                        size_t count)
+@@ -560,4 +591,4 @@ void projectm_set_log_level(projectm_log_level log_level, bool current_thread_on
+     {
+         libprojectM::Logging::SetGlobalLogLevel(static_cast<libprojectM::Logging::LogLevel>(log_level));
+     }
+-}
+\ No newline at end of file
++}
+diff --git a/src/libprojectM/Renderer/Platform/GLResolver.cpp b/src/libprojectM/Renderer/Platform/GLResolver.cpp
+index 21eb4acaa..6dcb293ae 100644
+--- a/src/libprojectM/Renderer/Platform/GLResolver.cpp
++++ b/src/libprojectM/Renderer/Platform/GLResolver.cpp
+@@ -404,9 +404,20 @@ auto GLResolver::Initialize(UserResolver resolver, void* userData) -> bool
+         std::string reason;
+         if (!HasCurrentContext(currentContext, reason))
+         {
+-            m_loaded = false;
+-            LOG_ERROR(std::string("[GLResolver] No current GL context present: ") + reason);
+-            return false;
++            if (state.m_userResolver != nullptr)
++            {
++                currentContext.eglCurrent = true;
++                currentContext.eglAvailable = true;
++                LOG_INFO(std::string("[GLResolver] Current context could not be probed: ") +
++                         reason +
++                         "; assuming app-managed EGL/GLES context because a user resolver was supplied");
++            }
++            else
++            {
++                m_loaded = false;
++                LOG_ERROR(std::string("[GLResolver] No current GL context present: ") + reason);
++                return false;
++            }
+         }
+     }
+ 
+diff --git a/src/libprojectM/Renderer/Platform/GladLoader.cpp b/src/libprojectM/Renderer/Platform/GladLoader.cpp
+index 0cb30ae46..0978a829f 100644
+--- a/src/libprojectM/Renderer/Platform/GladLoader.cpp
++++ b/src/libprojectM/Renderer/Platform/GladLoader.cpp
+@@ -47,8 +47,8 @@ auto GladLoader::CheckGLRequirements() -> bool
+ 
+     glCheck
+         .WithApi(GLApi::OpenGLES)
+-        .WithMinimumVersion(3, 2)
+-        .WithMinimumShaderLanguageVersion(3, 20)
++        .WithMinimumVersion(3, 0)
++        .WithMinimumShaderLanguageVersion(3, 0)
+         //        .WithRequiredExtension("GL_OES_texture_float")
+         //        .WithRequiredExtension("GL_OES_standard_derivatives")
+         .WithRequireCoreProfile(false);
+diff --git a/src/libprojectM/Renderer/RenderContext.hpp b/src/libprojectM/Renderer/RenderContext.hpp
+index 9fec280dc..881b7e03e 100644
+--- a/src/libprojectM/Renderer/RenderContext.hpp
++++ b/src/libprojectM/Renderer/RenderContext.hpp
+@@ -5,6 +5,7 @@
+ #pragma once
+ 
+ #include <projectM-4/projectM_cxx_export.h>
++#include <projectM-4/callbacks.h>
+ 
+ namespace libprojectM {
+ namespace Renderer {
+@@ -38,6 +39,10 @@ public:
+ 
+     TextureManager* textureManager{nullptr}; //!< Holds all loaded textures for shader access.
+     ShaderCache* shaderCache{nullptr}; //!< The shader chace of this projectM instance.
++
++    //!< Optional, app-provided preprocessed-HLSL cache hooks. Null unless registered via
++    //!< projectm_set_preprocess_cache. Points at storage owned by the ProjectM instance.
++    const projectm_preprocess_cache_hooks* preprocessCache{nullptr};
+ };
+ 
+ } // namespace Renderer
+diff --git a/src/libprojectM/Renderer/Shader.cpp b/src/libprojectM/Renderer/Shader.cpp
+index 58e03ae79..704bd97de 100644
+--- a/src/libprojectM/Renderer/Shader.cpp
++++ b/src/libprojectM/Renderer/Shader.cpp
+@@ -3,11 +3,24 @@
+ #include <Logging.hpp>
+ #include <glm/gtc/type_ptr.hpp>
+ 
++#include <chrono>
+ #include <vector>
+ 
++// RoonVis local patch (Phase 3c): non-blocking link-completion poll
++// (GL_KHR_parallel_shader_compile). Value per the KHR extension spec.
++#ifndef GL_COMPLETION_STATUS_KHR
++#define GL_COMPLETION_STATUS_KHR 0x91B1
++#endif
++
+ namespace libprojectM {
+ namespace Renderer {
+ 
++namespace {
++// RoonVis local patch (Phase 3c): when set (render/GL thread only, around preset
++// preload), CompileProgram leaves the link in flight instead of resolving it.
++bool s_deferCompilation{false};
++} // namespace
++
+ Shader::Shader()
+     : m_shaderProgram(glCreateProgram())
+ {
+@@ -17,19 +30,137 @@ Shader::~Shader()
+ {
+     if (m_shaderProgram)
+     {
++        // Note: deleting a program with a pending background link resolves (blocks on)
++        // the link inside ANGLE first. Acceptable: only reached when a preload is
++        // discarded, and by then the compile is normally long finished.
+         glDeleteProgram(m_shaderProgram);
+     }
++    if (m_pendingVertexShader)
++    {
++        glDeleteShader(m_pendingVertexShader);
++    }
++    if (m_pendingFragmentShader)
++    {
++        glDeleteShader(m_pendingFragmentShader);
++    }
++}
++
++void Shader::SetDeferCompilation(bool defer)
++{
++    s_deferCompilation = defer;
++}
++
++auto Shader::HasPendingCompile() const -> bool
++{
++    return m_pendingLink;
++}
++
++auto Shader::PendingCompileReady() const -> bool
++{
++    if (!m_pendingLink)
++    {
++        return true;
++    }
++
++    // Explicitly non-resolving in ANGLE: reports whether the background link (including
++    // the Metal shader-library subtasks) has finished, without waiting for it.
++    GLint completed{GL_FALSE};
++    glGetProgramiv(m_shaderProgram, GL_COMPLETION_STATUS_KHR, &completed);
++    return completed == GL_TRUE;
++}
++
++void Shader::FinalizeCompile() const
++{
++    if (!m_pendingLink)
++    {
++        return;
++    }
++    m_pendingLink = false;
++
++    // The detach/delete below is what resolves the link inside ANGLE (blocking if the
++    // background compile is still running — callers gate on PendingCompileReady()).
++    glDetachShader(m_shaderProgram, m_pendingVertexShader);
++    glDetachShader(m_shaderProgram, m_pendingFragmentShader);
++    glDeleteShader(m_pendingVertexShader);
++    glDeleteShader(m_pendingFragmentShader);
++    m_pendingVertexShader = 0;
++    m_pendingFragmentShader = 0;
++
++    std::string vertexShaderSource;
++    std::string fragmentShaderSource;
++    std::swap(vertexShaderSource, m_pendingVertexSource);
++    std::swap(fragmentShaderSource, m_pendingFragmentSource);
++
++    GLint programLinked{};
++    glGetProgramiv(m_shaderProgram, GL_LINK_STATUS, &programLinked);
++    if (programLinked == GL_TRUE)
++    {
++        return;
++    }
++
++    GLint infoLogLength{};
++    glGetProgramiv(m_shaderProgram, GL_INFO_LOG_LENGTH, &infoLogLength);
++    std::vector<char> message(infoLogLength + 1);
++    glGetProgramInfoLog(m_shaderProgram, infoLogLength, nullptr, message.data());
++
++    std::string linkError = "[Shader] Error linking deferred shader program: " + std::string(message.data());
++    LOG_ERROR(linkError);
++    LOG_DEBUG("[Shader] Vertex shader source: " + vertexShaderSource);
++    LOG_DEBUG("[Shader] Fragment shader source: " + fragmentShaderSource);
++    throw ShaderException(linkError);
++}
++
++void Shader::EnsureFinalizedNoThrow() const noexcept
++{
++    if (!m_pendingLink)
++    {
++        return;
++    }
++    try
++    {
++        FinalizeCompile();
++    }
++    catch (const ShaderException& ex)
++    {
++        // Safety net only: real preload paths finalize explicitly (with fallback
++        // handling) before first use. A shader that fails here draws nothing.
++        LOG_ERROR(std::string("[Shader] Deferred compile failed at first use: ") + ex.message());
++    }
+ }
+ 
+ void Shader::CompileProgram(const std::string& vertexShaderSource,
+                             const std::string& fragmentShaderSource)
+ {
++    // Recompiling a shader that still has a deferred link in flight: settle it first.
++    EnsureFinalizedNoThrow();
++
+     auto vertexShader = CompileShader(vertexShaderSource, GL_VERTEX_SHADER);
+     auto fragmentShader = CompileShader(fragmentShaderSource, GL_FRAGMENT_SHADER);
+ 
+     glAttachShader(m_shaderProgram, vertexShader);
+     glAttachShader(m_shaderProgram, fragmentShader);
+ 
++    if (s_deferCompilation)
++    {
++        // RoonVis local patch (Phase 3c): leave the link running on ANGLE's worker pool.
++        // Everything past glLinkProgram that touches the program — INCLUDING the
++        // glDetachShader in the normal path below — would synchronously resolve the link
++        // on this thread, so all of it moves to FinalizeCompile().
++        const auto linkStart = std::chrono::steady_clock::now();
++        glLinkProgram(m_shaderProgram);
++        const double linkMs = std::chrono::duration<double, std::milli>(
++                                  std::chrono::steady_clock::now() - linkStart)
++                                  .count();
++        LOG_INFO("[Shader] Deferred link posted: glLinkProgram=" + std::to_string(linkMs) + "ms program=" + std::to_string(m_shaderProgram));
++
++        m_pendingLink = true;
++        m_pendingVertexShader = vertexShader;
++        m_pendingFragmentShader = fragmentShader;
++        m_pendingVertexSource = vertexShaderSource;
++        m_pendingFragmentSource = fragmentShaderSource;
++        return;
++    }
++
+     glLinkProgram(m_shaderProgram);
+ 
+     // Shader objects are no longer needed after linking, free the memory.
+@@ -59,6 +190,8 @@ void Shader::CompileProgram(const std::string& vertexShaderSource,
+ 
+ bool Shader::Validate(std::string& validationMessage) const
+ {
++    EnsureFinalizedNoThrow();
++
+     GLint result{GL_FALSE};
+     int infoLogLength;
+ 
+@@ -78,6 +211,10 @@ bool Shader::Validate(std::string& validationMessage) const
+ 
+ void Shader::Bind() const
+ {
++    // Every render path binds before setting uniforms, so finalizing here covers the
++    // deferred-compile safety net for all program uses.
++    EnsureFinalizedNoThrow();
++
+     if (m_shaderProgram > 0)
+     {
+         glUseProgram(m_shaderProgram);
+@@ -199,6 +336,14 @@ GLuint Shader::CompileShader(const std::string& source, GLenum type)
+ 
+     glCompileShader(shader);
+ 
++    if (s_deferCompilation)
++    {
++        // RoonVis local patch (Phase 3c): the status query would synchronously resolve
++        // the background translate job. Compile errors surface as a link failure in
++        // FinalizeCompile() instead.
++        return shader;
++    }
++
+     glGetShaderiv(shader, GL_COMPILE_STATUS, &shaderCompiled);
+     if (shaderCompiled == GL_TRUE)
+     {
+diff --git a/src/libprojectM/Renderer/Shader.hpp b/src/libprojectM/Renderer/Shader.hpp
+index 79b2f15ca..39be49a69 100644
+--- a/src/libprojectM/Renderer/Shader.hpp
++++ b/src/libprojectM/Renderer/Shader.hpp
+@@ -79,6 +79,44 @@ public:
+     void CompileProgram(const std::string& vertexShaderSource,
+                         const std::string& fragmentShaderSource);
+ 
++    /**
++     * RoonVis local patch (Phase 3c, deferred GL compile):
++     *
++     * ANGLE backgrounds glCompileShader/glLinkProgram on a worker pool
++     * (GL_KHR_parallel_shader_compile), but ANY program-observing call — including the
++     * glDetachShader right after glLinkProgram in CompileProgram — synchronously resolves
++     * the link on the calling thread. While the defer flag is set (only around preset
++     * preload), CompileProgram skips the status queries AND the detach/delete cleanup,
++     * leaving the link in flight; callers poll PendingCompileReady() (non-blocking
++     * GL_COMPLETION_STATUS_KHR) and call FinalizeCompile() once ready. Bind()/Validate()/
++     * SetUniform* finalize lazily as a safety net, so a pending shader is always safe to
++     * use — first use just blocks until the background compile finishes.
++     */
++
++    /**
++     * @brief Globally enables/disables deferred compilation for subsequent CompileProgram calls.
++     * Render/GL thread only. Only set around preset preloading.
++     */
++    static void SetDeferCompilation(bool defer);
++
++    /**
++     * @brief Returns true if this shader has a deferred, not-yet-finalized link.
++     */
++    auto HasPendingCompile() const -> bool;
++
++    /**
++     * @brief Non-blocking: true once the deferred link has completed in the background
++     * (or if there is no pending compile). Does NOT resolve the link.
++     */
++    auto PendingCompileReady() const -> bool;
++
++    /**
++     * @brief Performs the deferred status check + shader cleanup for a pending compile.
++     * No-op if nothing is pending. Blocks if the background compile is still running.
++     * @throws ShaderException Thrown if the deferred compilation or linking failed.
++     */
++    void FinalizeCompile() const;
++
+     /**
+      * @brief Validates that the program can run in the current state.
+      * @param validationMessage The error message if validation failed.
+@@ -194,7 +232,21 @@ private:
+      */
+     auto CompileShader(const std::string& source, GLenum type) -> GLuint;
+ 
++    /**
++     * @brief Lazily finalizes a pending deferred compile, swallowing (but logging) errors.
++     * Safety net for Bind()/Validate()/SetUniform* so render paths never throw.
++     */
++    void EnsureFinalizedNoThrow() const noexcept;
++
+     GLuint m_shaderProgram{}; //!< The program ID.
++
++    // RoonVis local patch (Phase 3c): deferred-compile state. Mutable because the lazy
++    // finalize safety net runs from const accessors (Bind/SetUniform are const).
++    mutable bool m_pendingLink{false};           //!< A deferred link has not been finalized yet.
++    mutable GLuint m_pendingVertexShader{};      //!< Attached vertex shader awaiting detach/delete.
++    mutable GLuint m_pendingFragmentShader{};    //!< Attached fragment shader awaiting detach/delete.
++    mutable std::string m_pendingVertexSource;   //!< Kept for the error log if the deferred link fails.
++    mutable std::string m_pendingFragmentSource; //!< Kept for the error log if the deferred link fails.
+ };
+ 
+ } // namespace Renderer

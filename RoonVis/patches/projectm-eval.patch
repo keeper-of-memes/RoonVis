@@ -1,0 +1,22 @@
+diff --git a/projectm-eval/CMakeLists.txt b/projectm-eval/CMakeLists.txt
+index da83b6a..4bc7b32 100644
+--- a/projectm-eval/CMakeLists.txt
++++ b/projectm-eval/CMakeLists.txt
+@@ -9,7 +9,7 @@ set(FLEX_OUTPUT_FILES
+     ${CMAKE_CURRENT_SOURCE_DIR}/Scanner.h
+     )
+ 
+-if(FLEX_FOUND)
++if(FLEX_FOUND AND (NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/Scanner.c" OR NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/Scanner.h"))
+     # Generate lexer code
+     add_custom_command(COMMAND ${FLEX_EXECUTABLE}
+                        --noline
+@@ -27,7 +27,7 @@ if(FLEX_FOUND)
+                       )
+ endif()
+ 
+-if(BISON_FOUND)
++if(BISON_FOUND AND (NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/Compiler.c" OR NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/Compiler.h"))
+     # Generate compiler code
+     add_custom_command(COMMAND ${BISON_EXECUTABLE}
+                        --defines=Compiler.h

@@ -1,0 +1,6 @@
+[submodule "vendor/angle"]
+	path = vendor/angle
+	url = https://github.com/google/angle.git
+[submodule "vendor/projectm"]
+	path = vendor/projectm
+	url = https://github.com/projectM-visualizer/projectm.git

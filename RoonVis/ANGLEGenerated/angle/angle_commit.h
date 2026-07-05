@@ -1,0 +1,9 @@
+#ifndef ANGLE_COMMIT_H_
+#define ANGLE_COMMIT_H_
+
+#define ANGLE_COMMIT_HASH "a4eea1fbedace7a03bae52cd1bb9d6ebdfffb0f7"
+#define ANGLE_COMMIT_HASH_SIZE 40
+#define ANGLE_COMMIT_DATE "2026-06-16"
+#define ANGLE_COMMIT_POSITION 0
+
+#endif  // ANGLE_COMMIT_H_
