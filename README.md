@@ -1,15 +1,17 @@
 # RoonVis
 
-**A native tvOS (Apple TV 4K) music visualizer.** RoonVis renders Milkdrop presets with
+**A native tvOS (Apple TV) music visualizer.** RoonVis renders Milkdrop presets with
 [libprojectM](https://github.com/projectM-visualizer/projectm) — via [ANGLE](https://github.com/google/angle)
 (OpenGL ES 3.0 → Metal) — reacting in real time to audio streamed from **Roon** over **Snapcast**.
 It works end-to-end on real hardware.
 
 <!-- TODO: screenshot / gif here -->
 
-> ⚠️ **Tested only on Apple TV 4K (3rd gen), tvOS.** Other Apple TV models are **untested and
-> unsupported** — RoonVis may work on them, but it's not recommended, purely due to lack of testing.
-> All the performance tuning (1080p, mesh size, latency) was measured on the A15.
+> ✅ **Supported on all Apple TV models on tvOS 26** (v0.1.1). Reference device: Apple TV 4K
+> 3rd gen (A15). The **Apple TV HD is validated** with reduced defaults (720p @ 30 fps) via a
+> vendored ANGLE patch that unlocks ES 3.0 on its GPU; 4K 1st/2nd gen are expected to work but
+> are untested on hardware. Older devices have real limitations — see
+> [Apple TV device support](../../wiki/Apple-TV-Device-Support) in the wiki.
 
 ---
 
@@ -62,7 +64,9 @@ Before building, set these for your environment:
 | Snapcast server host | `Info.plist` → `SnapcastServerHost` | your Pi's IP |
 
 **Recommended in-app settings** (also the shipped defaults): audio-sync **delay 270 ms**
-(+ **270 ms** on the Roon audio output), render **1080p**, warp **mesh 96×72**.
+(+ **270 ms** on the Roon audio output), render **1080p @ 60** (Apple TV HD: **720p @ 30**),
+warp **mesh 96×72** (HD: **64×48**). Frame rate and render quality are adjustable live in
+**Settings → Rendering**.
 → [Recommended Settings](../../wiki/Recommended-Settings) ·
 [Delay Structure](../../wiki/Delay-Structure) · [Supported Resolutions](../../wiki/Supported-Resolutions)
 
