@@ -11,6 +11,7 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 PM="$REPO_ROOT/vendor/projectm"
 PME="$PM/vendor/projectm-eval"
+ANGLE="$REPO_ROOT/vendor/angle"
 
 apply_patch() {
   local dir="$1" patch="$2"
@@ -28,4 +29,5 @@ apply_patch() {
 
 apply_patch "$PM"  "$REPO_ROOT/RoonVis/patches/projectm.patch"
 apply_patch "$PME" "$REPO_ROOT/RoonVis/patches/projectm-eval.patch"
+apply_patch "$ANGLE" "$REPO_ROOT/RoonVis/patches/angle-es3-legacy-gpu.patch"
 echo "done"

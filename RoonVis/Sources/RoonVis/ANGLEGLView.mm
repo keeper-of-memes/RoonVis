@@ -113,12 +113,12 @@ static CGSize RoonVisDrawableSizeOverride(void)
 static CGSize RoonVisTargetDrawableSize(UIView *view)
 {
     (void)view;
-    // 1080p (1920x1080) native render. 1440p was trialled 2026-07-05 with the 128x96 mesh
-    // and ran visibly poorly on device (regression), so the render stays at 1080p; the mesh
-    // bump is independent and kept. 4K remains deferred (transition-frame collapse). ATV4K
-    // UIScreen.scale is 1.0, so the size is set explicitly (carried by contentsScale in
-    // -initWithFrame:; width 1920 -> scale 1.0).
-    CGSize target = CGSizeMake(1920.0, 1080.0);
+    // Render size comes from the user's drawableSizePreset (tier-clamped in the
+    // settings getter; the Apple TV HD tops out at 1080p). Historical context:
+    // 1440p ran visibly poorly on the A15 with the 128x96 mesh (2026-07-05), so
+    // above-1080p presets carry a frame-rate warning in the settings UI. ATV
+    // UIScreen.scale is 1.0, so the size is set explicitly (carried by
+    // contentsScale in -applyDrawableConfiguration; width 1920 -> scale 1.0).
     CGSize overrideSize = RoonVisDrawableSizeOverride();
     if (overrideSize.width > 0.0 && overrideSize.height > 0.0)
     {
@@ -127,9 +127,12 @@ static CGSize RoonVisTargetDrawableSize(UIView *view)
                    overrideSize.height);
         return overrideSize;
     }
-    RoonVisLog(@"ANGLE target drawable: %.0fx%.0f (1080p fullscreen presentation)",
+    RoonVisDrawableSizePreset preset = [RoonVisSettings sharedSettings].drawableSizePreset;
+    CGSize target = RoonVisDrawableSizeForPreset(preset);
+    RoonVisLog(@"ANGLE target drawable: %.0fx%.0f (%@ preset)",
                target.width,
-               target.height);
+               target.height,
+               RoonVisDrawableSizePresetLabel(preset));
     return target;
 }
 
@@ -137,6 +140,17 @@ static NSInteger RoonVisDisplayRefreshRate(UIView *view)
 {
     NSInteger refreshRate = RoonVisScreenForView(view).maximumFramesPerSecond;
     return refreshRate > 0 ? refreshRate : 60;
+}
+
+// The render rate the app actually targets: the user's frame-rate cap bounded
+// by the panel's refresh rate. Single source of truth for the display link,
+// projectM's fps hint, the warm-budget frame interval, and the slow-preset
+// thresholds — a resize or mode change must never reintroduce the uncapped rate.
+extern "C" NSInteger RoonVisEffectiveFrameRate(UIView *view)
+{
+    NSInteger screenMax = RoonVisDisplayRefreshRate(view);
+    NSInteger cap = [RoonVisSettings sharedSettings].frameRateCap;
+    return cap > 0 ? MIN(screenMax, cap) : screenMax;
 }
 
 static BOOL RoonVisPerfDiagnosticsEnabled()
@@ -197,8 +211,8 @@ static BOOL RoonVisDisableSlowPresetSkip()
         if (targetDrawableSize.width > 0.0 && targetDrawableSize.height > 0.0)
         {
             // ANGLE derives the EGL surface size from bounds x contentsScale, so the render
-            // target (default 1440p, or the ROONVIS_DRAWABLE_SIZE override) must be carried by
-            // the scale, not just the drawableSize assignment. width=1920 -> 1.0 (1080p),
+            // target (the user's size preset, or the ROONVIS_DRAWABLE_SIZE override) must be
+            // carried by the scale, not just the drawableSize assignment. width=1920 -> 1.0 (1080p),
             // 2560 -> 1.333 (1440p), 3840 -> 2.0 (4K). Without this ANGLE resets to a
             // quarter-screen surface (historical bug 6d06761).
             const CGFloat scale = targetDrawableSize.width / 1920.0;
@@ -206,10 +220,11 @@ static BOOL RoonVisDisableSlowPresetSkip()
             metalLayer.contentsScale = scale;
             metalLayer.drawableSize = targetDrawableSize;
         }
-        RoonVisLog(@"ANGLE display mode chosen: drawable %.0fx%.0f fps=%ld",
+        RoonVisLog(@"ANGLE display mode chosen: drawable %.0fx%.0f fps=%ld (tier=%ld)",
                    metalLayer.drawableSize.width,
                    metalLayer.drawableSize.height,
-                   static_cast<long>(RoonVisDisplayRefreshRate(self)));
+                   static_cast<long>(RoonVisEffectiveFrameRate(self)),
+                   static_cast<long>(RoonVisCurrentDeviceTier()));
         self.eglDisplay = EGL_NO_DISPLAY;
         self.eglSurface = EGL_NO_SURFACE;
         self.eglContext = EGL_NO_CONTEXT;
@@ -219,6 +234,17 @@ static BOOL RoonVisDisableSlowPresetSkip()
         RoonVisPerfCountersSetEnabled(_perfDiagnosticsEnabled);
         _disableSlowPresetSkip = RoonVisDisableSlowPresetSkip();
         _presetWarmStrategy = RoonVis::PresetWarmStrategy::IdleFrame;
+        if (RoonVisCurrentDeviceTier() == RoonVisDeviceTierHD)
+        {
+            // The A8 has far less headroom per frame: halve the per-attempt warm
+            // budget (8 -> 4 ms, a similar fraction of a 33 ms frame as 8 ms is
+            // of 16.7 ms) and require a longer idle settle before warming starts.
+            // Depth stays 1 everywhere (a single projectM preload slot exists).
+            _presetIdleWarmBudget = RoonVis::PresetIdleWarmBudget(
+                RoonVis::kPresetIdleWarmFrameBudgetSeconds,
+                RoonVis::kPresetIdleWarmAttemptBudgetSeconds * 0.5,
+                RoonVis::kPresetIdleWarmRequiredFrames + 2);
+        }
         [self applyPresetWarmCacheSettings];
         _wouldSkipSlowPresetNames = [[NSMutableOrderedSet alloc] init];
         if (_disableSlowPresetSkip)
@@ -300,36 +326,46 @@ static BOOL RoonVisDisableSlowPresetSkip()
 - (void)layoutSubviews
 {
     [super layoutSubviews];
-    CAMetalLayer *metalLayer = (CAMetalLayer *)self.layer;
-    metalLayer.drawableSize = RoonVisTargetDrawableSize(self);
-    if (![self recreateSurfaceIfNeededForDrawableSize:metalLayer.drawableSize])
-    {
-        return;
-    }
-    [self.projectMBridge resizeToDrawableSize:metalLayer.drawableSize];
-    [self drawFrame];
+    [self applyDrawableConfiguration];
 }
 
 - (void)applyDisplayTimingToDisplayLink
 {
-    NSInteger refreshRate = RoonVisDisplayRefreshRate(self);
-    self.displayLink.preferredFramesPerSecond = refreshRate;
+    self.displayLink.preferredFramesPerSecond = RoonVisEffectiveFrameRate(self);
+}
+
+// Applies the current target drawable size to the layer AND the content scale
+// factors together, then recreates the EGL surface if the size changed. ANGLE
+// derives the surface size from bounds x contentsScale at
+// eglCreateWindowSurface, so setting drawableSize alone silently reverts to a
+// quarter-screen surface (historical bug 6d06761). Every path that can change
+// the render size (init/layout/screen mode/settings) must come through here.
+- (void)applyDrawableConfiguration
+{
+    CGSize targetDrawableSize = RoonVisTargetDrawableSize(self);
+    if (targetDrawableSize.width <= 0.0 || targetDrawableSize.height <= 0.0)
+    {
+        return;
+    }
+    CAMetalLayer *metalLayer = (CAMetalLayer *)self.layer;
+    const CGFloat scale = targetDrawableSize.width / 1920.0;
+    self.contentScaleFactor = scale;
+    metalLayer.contentsScale = scale;
+    metalLayer.drawableSize = targetDrawableSize;
+    if (![self recreateSurfaceIfNeededForDrawableSize:targetDrawableSize])
+    {
+        return;
+    }
+    [self.projectMBridge resizeToDrawableSize:targetDrawableSize];
+    [self drawFrame];
 }
 
 - (void)screenModeDidChange:(NSNotification *)notification
 {
     [self applyDisplayTimingToDisplayLink];
-    CAMetalLayer *metalLayer = (CAMetalLayer *)self.layer;
-    metalLayer.drawableSize = RoonVisTargetDrawableSize(self);
-    RoonVisLog(@"ANGLE display mode changed: drawable %.0fx%.0f fps=%ld",
-               metalLayer.drawableSize.width,
-               metalLayer.drawableSize.height,
-               static_cast<long>(RoonVisDisplayRefreshRate(self)));
-    if ([self recreateSurfaceIfNeededForDrawableSize:metalLayer.drawableSize])
-    {
-        [self.projectMBridge resizeToDrawableSize:metalLayer.drawableSize];
-        [self drawFrame];
-    }
+    RoonVisLog(@"ANGLE display mode changed: fps=%ld",
+               static_cast<long>(RoonVisEffectiveFrameRate(self)));
+    [self applyDrawableConfiguration];
 }
 
 - (void)pause
@@ -437,7 +473,13 @@ static BOOL RoonVisDisableSlowPresetSkip()
 
     [self noteActivePresetForWarmCache];
 
-    CFTimeInterval targetFrameInterval = self.displayLink.duration > 0 ? self.displayLink.duration : frameInterval;
+    // The idle-budget target must be the EFFECTIVE frame interval, not the
+    // panel's vsync interval (displayLink.duration): under a 30 fps cap on a
+    // 60 Hz panel, real frames arrive every ~33 ms while duration stays
+    // ~16.7 ms, so a duration-based target would fail RecordFrame's 1.10x
+    // idle check every frame and warming would never run.
+    const NSInteger effectiveFrameRate = RoonVisEffectiveFrameRate(self);
+    CFTimeInterval targetFrameInterval = effectiveFrameRate > 0 ? 1.0 / static_cast<CFTimeInterval>(effectiveFrameRate) : frameInterval;
     BOOL canWarmNow = [self.projectMBridge canWarmPresetAtTime:now];
     if (!canWarmNow)
     {
@@ -489,6 +531,11 @@ static BOOL RoonVisDisableSlowPresetSkip()
     RoonVisPerfCountersSetEnabled(_perfDiagnosticsEnabled);
     _disableSlowPresetSkip = RoonVisDisableSlowPresetSkip();
     [self applyPresetWarmCacheSettings];
+    // Frame-rate cap and render-size preset take effect live: re-apply the
+    // display link rate and the drawable configuration (the latter is a no-op
+    // recreate when the size is unchanged).
+    [self applyDisplayTimingToDisplayLink];
+    [self applyDrawableConfiguration];
     if ([RoonVisSettings sharedSettings].diagnosticsOverlayEnabled)
     {
         [self resetPerformanceDiagnostics];

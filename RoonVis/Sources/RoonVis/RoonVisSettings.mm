@@ -2,6 +2,8 @@
 
 #import "RoonVisCrashReporter.h"
 
+#include "DeviceTier.h"
+
 #include <algorithm>
 #include <cmath>
 
@@ -19,6 +21,8 @@ NSString *const RoonVisSettingsFavoritesOnlyRotationKey = @"favoritesOnlyRotatio
 NSString *const RoonVisSettingsDiagnosticsOverlayEnabledKey = @"diagnosticsOverlayEnabled";
 NSString *const RoonVisSettingsFavoritePresetFilenamesKey = @"favoritePresetFilenames";
 NSString *const RoonVisSettingsHiddenPresetFilenamesKey = @"hiddenPresetFilenames";
+NSString *const RoonVisSettingsFrameRateCapKey = @"frameRateCap";
+NSString *const RoonVisSettingsDrawableSizePresetKey = @"drawableSizePreset";
 
 namespace
 {
@@ -27,6 +31,35 @@ static NSString *const kTransitionStyleInstantValue = @"instant";
 static NSString *const kPresetRotationModeLoopValue = @"loop";
 static NSString *const kPresetRotationModeShuffleValue = @"shuffle";
 static NSString *const kPresetRotationModeFavoritesValue = @"favorites";
+static NSString *const kDrawableSizePreset720pValue = @"720p";
+static NSString *const kDrawableSizePreset1080pValue = @"1080p";
+static NSString *const kDrawableSizePreset1440pValue = @"1440p";
+static NSString *const kDrawableSizePreset4KValue = @"4k";
+
+static NSString *DrawableSizePresetPersistedValue(RoonVisDrawableSizePreset preset)
+{
+    switch (preset)
+    {
+        case RoonVisDrawableSizePreset720p:
+            return kDrawableSizePreset720pValue;
+        case RoonVisDrawableSizePreset1080p:
+            return kDrawableSizePreset1080pValue;
+        case RoonVisDrawableSizePreset1440p:
+            return kDrawableSizePreset1440pValue;
+        case RoonVisDrawableSizePreset4K:
+            return kDrawableSizePreset4KValue;
+    }
+    return kDrawableSizePreset1080pValue;
+}
+
+// Clamps to the current device tier's maximum (the HD tops out at 1080p); an
+// out-of-range stored value (e.g. defaults migrated from a 4K box) downgrades
+// rather than erroring.
+static RoonVisDrawableSizePreset ClampDrawableSizePresetToTier(RoonVisDrawableSizePreset preset)
+{
+    const RoonVisDrawableSizePreset maxPreset = RoonVisMaxDrawablePresetForCurrentTier();
+    return preset > maxPreset ? maxPreset : preset;
+}
 
 static constexpr NSInteger kRotationIntervalMinimum = 60;
 static constexpr NSInteger kRotationIntervalMaximum = 900;
@@ -138,11 +171,15 @@ static NSSet<NSString *> *FilenameSetFromDefaultsValue(id value)
             RoonVisSettingsBeatHardCutSensitivityKey: @(1.0),
             RoonVisSettingsAudioSensitivityKey: @(1.0),
             RoonVisSettingsAudioInputDelayMsKey: @(270),
-            RoonVisSettingsWarpMeshWidthKey: @(96),
+            RoonVisSettingsWarpMeshWidthKey: @(RoonVisDefaultWarpMeshWidthForCurrentTier()),
             RoonVisSettingsFavoritesOnlyRotationKey: @NO,
             RoonVisSettingsDiagnosticsOverlayEnabledKey: @NO,
             RoonVisSettingsFavoritePresetFilenamesKey: @[],
             RoonVisSettingsHiddenPresetFilenamesKey: @[],
+            // Tier-resolved defaults (HD: 720p@30, everything else 1080p@60).
+            // Resolved once here at startup; both getters also clamp per tier.
+            RoonVisSettingsFrameRateCapKey: @(RoonVisDefaultFrameRateForCurrentTier()),
+            RoonVisSettingsDrawableSizePresetKey: DrawableSizePresetPersistedValue(RoonVisDefaultDrawablePresetForCurrentTier()),
         };
         [[NSUserDefaults standardUserDefaults] registerDefaults:defaults];
     });
@@ -379,6 +416,68 @@ static NSSet<NSString *> *FilenameSetFromDefaultsValue(id value)
     [[self defaults] setBool:diagnosticsOverlayEnabled forKey:RoonVisSettingsDiagnosticsOverlayEnabledKey];
     RoonVisLog(@"Settings changed: diagnosticsOverlayEnabled=%@", diagnosticsOverlayEnabled ? @"YES" : @"NO");
     [self postChangeNotificationForKey:RoonVisSettingsDiagnosticsOverlayEnabledKey];
+}
+
+- (NSInteger)frameRateCap
+{
+    NSInteger stored = [[self defaults] integerForKey:RoonVisSettingsFrameRateCapKey];
+    if (stored <= 0)
+    {
+        stored = RoonVisDefaultFrameRateForCurrentTier();
+    }
+    return RoonVis::SnapFrameRateCap(static_cast<int>(stored));
+}
+
+- (void)setFrameRateCap:(NSInteger)frameRateCap
+{
+    NSInteger snapped = RoonVis::SnapFrameRateCap(static_cast<int>(frameRateCap));
+    if (self.frameRateCap == snapped)
+    {
+        return;
+    }
+    [[self defaults] setInteger:snapped forKey:RoonVisSettingsFrameRateCapKey];
+    RoonVisLog(@"Settings changed: frameRateCap=%ld", static_cast<long>(snapped));
+    [self postChangeNotificationForKey:RoonVisSettingsFrameRateCapKey];
+}
+
+- (RoonVisDrawableSizePreset)drawableSizePreset
+{
+    id value = [[self defaults] objectForKey:RoonVisSettingsDrawableSizePresetKey];
+    RoonVisDrawableSizePreset preset = RoonVisDefaultDrawablePresetForCurrentTier();
+    if ([value isKindOfClass:NSString.class])
+    {
+        NSString *stored = static_cast<NSString *>(value);
+        if ([stored isEqualToString:kDrawableSizePreset720pValue])
+        {
+            preset = RoonVisDrawableSizePreset720p;
+        }
+        else if ([stored isEqualToString:kDrawableSizePreset1080pValue])
+        {
+            preset = RoonVisDrawableSizePreset1080p;
+        }
+        else if ([stored isEqualToString:kDrawableSizePreset1440pValue])
+        {
+            preset = RoonVisDrawableSizePreset1440p;
+        }
+        else if ([stored isEqualToString:kDrawableSizePreset4KValue])
+        {
+            preset = RoonVisDrawableSizePreset4K;
+        }
+    }
+    return ClampDrawableSizePresetToTier(preset);
+}
+
+- (void)setDrawableSizePreset:(RoonVisDrawableSizePreset)drawableSizePreset
+{
+    RoonVisDrawableSizePreset clamped = ClampDrawableSizePresetToTier(drawableSizePreset);
+    if (self.drawableSizePreset == clamped)
+    {
+        return;
+    }
+    [[self defaults] setObject:DrawableSizePresetPersistedValue(clamped)
+                        forKey:RoonVisSettingsDrawableSizePresetKey];
+    RoonVisLog(@"Settings changed: drawableSizePreset=%@", RoonVisDrawableSizePresetLabel(clamped));
+    [self postChangeNotificationForKey:RoonVisSettingsDrawableSizePresetKey];
 }
 
 - (NSSet<NSString *> *)favoritePresetFilenames

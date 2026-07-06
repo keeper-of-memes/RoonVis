@@ -444,7 +444,7 @@ int main(int argc, char **argv)
         return RunWavProbe(argv[2]);
     }
 
-    std::string host = argc > 1 ? argv[1] : "127.0.0.1";
+    std::string host = argc > 1 ? argv[1] : "192.0.2.10";
     std::string port = argc > 2 ? argv[2] : "1704";
     double seconds = argc > 3 ? std::stod(argv[3]) : 8.0;
 

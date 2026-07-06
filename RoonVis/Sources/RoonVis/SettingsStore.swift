@@ -39,6 +39,14 @@ final class SettingsStore: ObservableObject {
         get { previewValues?.diagnosticsOverlayEnabled ?? settings.isDiagnosticsOverlayEnabled }
         set { write(\.diagnosticsOverlayEnabled, newValue) { settings.isDiagnosticsOverlayEnabled = newValue } }
     }
+    var frameRateCap: Int {
+        get { previewValues?.frameRateCap ?? settings.frameRateCap }
+        set { write(\.frameRateCap, newValue) { settings.frameRateCap = newValue } }
+    }
+    var drawableSizePreset: RoonVisDrawableSizePreset {
+        get { previewValues?.drawableSizePreset ?? settings.drawableSizePreset }
+        set { write(\.drawableSizePreset, newValue) { settings.drawableSizePreset = newValue } }
+    }
     var favoritePresetFilenames: Set<String> {
         get { previewValues?.favoritePresetFilenames ?? Set(settings.favoritePresetFilenames) }
         set { write(\.favoritePresetFilenames, newValue) { settings.favoritePresetFilenames = newValue } }
@@ -117,6 +125,8 @@ private struct PreviewValues {
     var warpMeshWidth: Int
     var presetRotationMode: RoonVisPresetRotationMode
     var diagnosticsOverlayEnabled: Bool
+    var frameRateCap: Int
+    var drawableSizePreset: RoonVisDrawableSizePreset
     var favoritePresetFilenames: Set<String>
     var hiddenPresetFilenames: Set<String>
 
@@ -130,6 +140,8 @@ private struct PreviewValues {
         warpMeshWidth = settings.warpMeshWidth
         presetRotationMode = settings.presetRotationMode
         diagnosticsOverlayEnabled = settings.isDiagnosticsOverlayEnabled
+        frameRateCap = settings.frameRateCap
+        drawableSizePreset = settings.drawableSizePreset
         favoritePresetFilenames = Set(settings.favoritePresetFilenames)
         hiddenPresetFilenames = Set(settings.hiddenPresetFilenames)
     }
@@ -152,6 +164,8 @@ extension SettingsStore {
         store.warpMeshWidth = 96
         store.presetRotationMode = presetRotationMode
         store.diagnosticsOverlayEnabled = diagnosticsEnabled
+        store.frameRateCap = 60
+        store.drawableSizePreset = .preset1080p
         store.favoritePresetFilenames = ["milkdrop-preview-01.milk", "milkdrop-preview-03.milk"]
         store.hiddenPresetFilenames = []
         return store

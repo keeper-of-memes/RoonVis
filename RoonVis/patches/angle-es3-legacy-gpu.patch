@@ -1,0 +1,19 @@
+diff --git a/src/libANGLE/renderer/metal/DisplayMtl.mm b/src/libANGLE/renderer/metal/DisplayMtl.mm
+index ac0d8a3..61c216a 100644
+--- a/src/libANGLE/renderer/metal/DisplayMtl.mm
++++ b/src/libANGLE/renderer/metal/DisplayMtl.mm
+@@ -439,6 +439,14 @@ bool IsMetalDisplayAvailable()
+     {
+         return mtl::kMaxSupportedGLVersion;
+     }
++    // RoonVis experiment: report ES 3.0 on Apple GPU family 2/3 (A8-A10X) to
++    // test whether projectM's ES3 usage subset actually works there. Upstream
++    // gates ES3 at family 4 (A11+); features genuinely missing below that may
++    // surface as GL errors or wrong rendering rather than a clean refusal.
++    if (supportsEitherGPUFamily(2, 1))
++    {
++        return gl::Version(3, 0);
++    }
+     return gl::Version(2, 0);
+ #endif
+ }

@@ -10,6 +10,11 @@
 
 NS_ASSUME_NONNULL_BEGIN
 
+// Effective render rate: the user's frame-rate cap bounded by the panel's
+// refresh rate. Defined in ANGLEGLView.mm; shared with the Diagnostics
+// category so the slow-preset thresholds scale with the capped rate.
+FOUNDATION_EXPORT NSInteger RoonVisEffectiveFrameRate(UIView *view);
+
 @interface ANGLEGLView ()
 {
     BOOL _perfDiagnosticsEnabled;

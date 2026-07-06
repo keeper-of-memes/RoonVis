@@ -118,8 +118,17 @@ NS_ASSUME_NONNULL_BEGIN
 - (void)loadLearnedSlowPresets;
 - (void)persistLearnedSlowState;
 - (std::vector<RoonVis::PresetShelfInput>)presetShelfInputsFavoritesOnly:(BOOL)favoritesOnly;
+- (std::vector<RoonVis::PresetShelfInput>)presetShelfInputsFavoritesOnly:(BOOL)favoritesOnly includeHidden:(BOOL)includeHidden;
 - (std::vector<size_t>)rotationCandidateIndexesForMode:(RoonVisPresetRotationMode)mode;
+// The FULL rotation order for a mode: retains hidden/slow entries so the
+// rotation cursor's anchor stays findable after an exclusion (exclusion is a
+// predicate at advance time, not a list mutation).
+- (std::vector<size_t>)fullRotationOrderForMode:(RoonVisPresetRotationMode)mode;
 - (size_t)nextRotationIndexFrom:(size_t)index offset:(NSInteger)offset;
+// The single rotation anchor shared by rotation advance AND warm-preload
+// candidate selection: the confirmed preset normally, the requested one while
+// a load is in flight. SIZE_MAX when nothing has been requested yet.
+- (size_t)rotationAnchorIndex;
 - (void)notifyEngineStateDidChange;
 - (void)invalidatePreloadedPresetTracking;
 - (void)schedulePresetPreloadIfReadyAtTime:(CFTimeInterval)now;

@@ -11,14 +11,86 @@ index 7e61f5266..662cb1d35 100644
  
  list(APPEND CMAKE_MODULE_PATH "${PROJECTM_SOURCE_DIR}/cmake")
  
-diff --git a/src/api/include/projectM-4/callbacks.h b/src/api/include/projectM-4/callbacks.h
-index 3ba9e1bcb..dd1700146 100644
---- a/src/api/include/projectM-4/callbacks.h
-+++ b/src/api/include/projectM-4/callbacks.h
-@@ -161,6 +161,54 @@ PROJECTM_EXPORT void projectm_set_texture_load_event_callback(projectm_handle in
-                                                               projectm_texture_load_event callback,
-                                                               void* user_data);
+diff --git a/src/api/CMakeLists.txt b/src/api/CMakeLists.txt
+index 3228e85b3..597a3b8e6 100644
+--- a/src/api/CMakeLists.txt
++++ b/src/api/CMakeLists.txt
+@@ -29,6 +29,7 @@ set(PROJECTM_PUBLIC_HEADERS
+         "${CMAKE_CURRENT_SOURCE_DIR}/include/projectM-4/logging.h"
+         "${CMAKE_CURRENT_SOURCE_DIR}/include/projectM-4/memory.h"
+         "${CMAKE_CURRENT_SOURCE_DIR}/include/projectM-4/parameters.h"
++        "${CMAKE_CURRENT_SOURCE_DIR}/include/projectM-4/preprocess_cache.h"
+         "${CMAKE_CURRENT_SOURCE_DIR}/include/projectM-4/projectM.h"
+         "${CMAKE_CURRENT_SOURCE_DIR}/include/projectM-4/render_opengl.h"
+         "${CMAKE_CURRENT_SOURCE_DIR}/include/projectM-4/touch.h"
+diff --git a/src/api/include/projectM-4/core.h b/src/api/include/projectM-4/core.h
+index 9a42545ac..7e95a10e3 100644
+--- a/src/api/include/projectM-4/core.h
++++ b/src/api/include/projectM-4/core.h
+@@ -108,6 +108,21 @@ PROJECTM_EXPORT void projectm_destroy(projectm_handle instance);
+ PROJECTM_EXPORT void projectm_load_preset_file(projectm_handle instance, const char* filename,
+                                                bool smooth_transition);
  
++PROJECTM_EXPORT void projectm_preload_preset_file(projectm_handle instance, const char* filename);
++
++PROJECTM_EXPORT bool projectm_activate_preloaded_preset(projectm_handle instance,
++                                                        bool smooth_transition);
++
++PROJECTM_EXPORT bool projectm_has_preloaded_preset(projectm_handle instance);
++
++/**
++ * @brief Non-blocking: true once the preloaded preset's deferred background shader
++ *        compiles have finished (GL_KHR_parallel_shader_compile). False if nothing is
++ *        preloaded. Gate projectm_activate_preloaded_preset() on this to keep the
++ *        finalize step instant.
++ */
++PROJECTM_EXPORT bool projectm_preloaded_preset_compile_ready(projectm_handle instance);
++
+ /**
+  * @brief Loads a preset from the data pointer.
+  *
+diff --git a/src/api/include/projectM-4/preprocess_cache.h b/src/api/include/projectM-4/preprocess_cache.h
+new file mode 100644
+index 000000000..73ee61451
+--- /dev/null
++++ b/src/api/include/projectM-4/preprocess_cache.h
+@@ -0,0 +1,87 @@
++/**
++ * @file preprocess_cache.h
++ * @copyright 2003-2026 projectM Team
++ * @brief Optional application-provided cache for preprocessed Milkdrop preset shaders.
++ * @since 4.2.0
++ *
++ * projectM -- Milkdrop-esque visualisation SDK
++ * Copyright (C)2003-2024 projectM Team
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
++ * See 'LICENSE.txt' included within this release
++ *
++ */
++
++#pragma once
++
++#include "projectM-4/types.h"
++
++#include <stddef.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
 +/**
 + * @brief Optional hooks for caching the preprocessed-HLSL text of Milkdrop preset shaders.
 + *
@@ -67,35 +139,21 @@ index 3ba9e1bcb..dd1700146 100644
 +PROJECTM_EXPORT void projectm_set_preprocess_cache(projectm_handle instance,
 +                                                   const projectm_preprocess_cache_hooks* hooks);
 +
- #ifdef __cplusplus
- } // extern "C"
- #endif
-diff --git a/src/api/include/projectM-4/core.h b/src/api/include/projectM-4/core.h
-index 9a42545ac..7e95a10e3 100644
---- a/src/api/include/projectM-4/core.h
-+++ b/src/api/include/projectM-4/core.h
-@@ -108,6 +108,21 @@ PROJECTM_EXPORT void projectm_destroy(projectm_handle instance);
- PROJECTM_EXPORT void projectm_load_preset_file(projectm_handle instance, const char* filename,
-                                                bool smooth_transition);
- 
-+PROJECTM_EXPORT void projectm_preload_preset_file(projectm_handle instance, const char* filename);
-+
-+PROJECTM_EXPORT bool projectm_activate_preloaded_preset(projectm_handle instance,
-+                                                        bool smooth_transition);
-+
-+PROJECTM_EXPORT bool projectm_has_preloaded_preset(projectm_handle instance);
-+
-+/**
-+ * @brief Non-blocking: true once the preloaded preset's deferred background shader
-+ *        compiles have finished (GL_KHR_parallel_shader_compile). False if nothing is
-+ *        preloaded. Gate projectm_activate_preloaded_preset() on this to keep the
-+ *        finalize step instant.
-+ */
-+PROJECTM_EXPORT bool projectm_preloaded_preset_compile_ready(projectm_handle instance);
-+
- /**
-  * @brief Loads a preset from the data pointer.
-  *
++#ifdef __cplusplus
++} // extern "C"
++#endif
+diff --git a/src/api/include/projectM-4/projectM.h b/src/api/include/projectM-4/projectM.h
+index 5b646af4d..b76a888d8 100644
+--- a/src/api/include/projectM-4/projectM.h
++++ b/src/api/include/projectM-4/projectM.h
+@@ -32,6 +32,7 @@
+ #include "projectM-4/logging.h"
+ #include "projectM-4/memory.h"
+ #include "projectM-4/parameters.h"
++#include "projectM-4/preprocess_cache.h"
+ #include "projectM-4/render_opengl.h"
+ #include "projectM-4/touch.h"
+ #include "projectM-4/version.h"
 diff --git a/src/libprojectM/Audio/PCM.cpp b/src/libprojectM/Audio/PCM.cpp
 index 1deea37ae..d7d18747e 100755
 --- a/src/libprojectM/Audio/PCM.cpp
@@ -489,7 +547,7 @@ index db8eb43ba..14fb82000 100644
  
  } // namespace MilkdropPreset
 diff --git a/src/libprojectM/MilkdropPreset/MilkdropShader.cpp b/src/libprojectM/MilkdropPreset/MilkdropShader.cpp
-index 10cf919ca..d93a8650d 100644
+index 10cf919ca..802117848 100644
 --- a/src/libprojectM/MilkdropPreset/MilkdropShader.cpp
 +++ b/src/libprojectM/MilkdropPreset/MilkdropShader.cpp
 @@ -1,5 +1,7 @@
@@ -701,7 +759,7 @@ index 10cf919ca..d93a8650d 100644
  }
  
  void MilkdropShader::GetReferencedSamplers(const std::string& program)
-@@ -615,12 +451,42 @@ void MilkdropShader::TranspileHLSLShader(const PresetState& presetState, std::st
+@@ -615,12 +451,47 @@ void MilkdropShader::TranspileHLSLShader(const PresetState& presetState, std::st
      M4::HLSLTree tree(&allocator);
      M4::HLSLParser parser(&allocator, &tree);
  
@@ -712,15 +770,19 @@ index 10cf919ca..d93a8650d 100644
 +    // byte-identical to the historical behaviour.
      std::string sourcePreprocessed;
 -    if (!parser.ApplyPreprocessor("", program.c_str(), program.size(), sourcePreprocessed))
--    {
--        LOG_DEBUG("[MilkdropShader] Failed " + shaderTypeString + " shader code:\n" + program);
--        throw Renderer::ShaderException("Error translating HLSL " + shaderTypeString + " shader: Preprocessing failed.");
 +    const auto* preprocessCacheHooks = presetState.renderContext.preprocessCache;
 +    bool preprocessCacheHit = false;
 +    std::string preprocessCacheKey;
++    if (preprocessCacheHooks != nullptr && (preprocessCacheHooks->get != nullptr || preprocessCacheHooks->put != nullptr))
+     {
+-        LOG_DEBUG("[MilkdropShader] Failed " + shaderTypeString + " shader code:\n" + program);
+-        throw Renderer::ShaderException("Error translating HLSL " + shaderTypeString + " shader: Preprocessing failed.");
++        // Computed for either hook: a put-only registration must not store under
++        // an empty key.
++        preprocessCacheKey = ComputePreprocessCacheKey(program);
++    }
 +    if (preprocessCacheHooks != nullptr && preprocessCacheHooks->get != nullptr)
 +    {
-+        preprocessCacheKey = ComputePreprocessCacheKey(program);
 +        // Sink appends the cached bytes into sourcePreprocessed for the duration of the call.
 +        auto appendSink = [](void* sinkctx, const char* data, size_t len) {
 +            auto* out = static_cast<std::string*>(sinkctx);
@@ -2123,14 +2185,14 @@ index 0cb30ae46..0978a829f 100644
          //        .WithRequiredExtension("GL_OES_standard_derivatives")
          .WithRequireCoreProfile(false);
 diff --git a/src/libprojectM/Renderer/RenderContext.hpp b/src/libprojectM/Renderer/RenderContext.hpp
-index 9fec280dc..881b7e03e 100644
+index 9fec280dc..f00e702f7 100644
 --- a/src/libprojectM/Renderer/RenderContext.hpp
 +++ b/src/libprojectM/Renderer/RenderContext.hpp
 @@ -5,6 +5,7 @@
  #pragma once
  
  #include <projectM-4/projectM_cxx_export.h>
-+#include <projectM-4/callbacks.h>
++#include <projectM-4/preprocess_cache.h>
  
  namespace libprojectM {
  namespace Renderer {

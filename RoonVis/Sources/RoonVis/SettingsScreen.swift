@@ -98,6 +98,22 @@ struct SettingsScreenView: View {
                 }
 
                 GlassPanel(title: "Rendering") {
+                    RVSegmentRow(
+                        systemImage: "speedometer",
+                        title: "Frame rate",
+                        description: "Caps the render rate. The actual rate follows the TV's refresh mode, so 25 and 50 only land exactly on 50 Hz output.",
+                        segments: SettingsScreenView.allowedFrameRates.map { "\($0)" },
+                        selection: frameRateCapBinding
+                    )
+
+                    RVSegmentRow(
+                        systemImage: "sparkles.tv",
+                        title: "Render quality",
+                        description: "Rendering size before the TV scales it. Sizes above 1080p look sharper but may reduce the frame rate on complex presets.",
+                        segments: allowedDrawablePresets.map { RoonVisDrawableSizePresetLabel($0) },
+                        selection: drawableSizePresetBinding
+                    )
+
                     RVStepperRow(
                         systemImage: "grid",
                         title: "Warp detail",
@@ -186,6 +202,42 @@ struct SettingsScreenView: View {
         Binding<Int>(
             get: { settings.transitionStyle == .instant ? 1 : 0 },
             set: { settings.transitionStyle = $0 == 1 ? .instant : .crossfade }
+        )
+    }
+
+    // The allowed frame-rate caps, matching RoonVis::SnapFrameRateCap's set.
+    static let allowedFrameRates = [25, 30, 50, 60]
+
+    // Drawable presets this device may select, capped by hardware tier (the
+    // Apple TV HD tops out at 1080p). Bindings map through these stable enum
+    // lists, never the raw segment index.
+    private var allowedDrawablePresets: [RoonVisDrawableSizePreset] {
+        let maxPreset = RoonVisMaxDrawablePresetForCurrentTier()
+        let all: [RoonVisDrawableSizePreset] = [.preset720p, .preset1080p, .preset1440p, .preset4K]
+        return all.filter { $0.rawValue <= maxPreset.rawValue }
+    }
+
+    private var frameRateCapBinding: Binding<Int> {
+        Binding<Int>(
+            get: {
+                SettingsScreenView.allowedFrameRates.firstIndex(of: settings.frameRateCap) ?? (SettingsScreenView.allowedFrameRates.count - 1)
+            },
+            set: { index in
+                let rates = SettingsScreenView.allowedFrameRates
+                settings.frameRateCap = rates[max(0, min(index, rates.count - 1))]
+            }
+        )
+    }
+
+    private var drawableSizePresetBinding: Binding<Int> {
+        Binding<Int>(
+            get: {
+                allowedDrawablePresets.firstIndex(of: settings.drawableSizePreset) ?? 0
+            },
+            set: { index in
+                let presets = allowedDrawablePresets
+                settings.drawableSizePreset = presets[max(0, min(index, presets.count - 1))]
+            }
         )
     }
 

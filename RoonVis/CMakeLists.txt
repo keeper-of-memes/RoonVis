@@ -5,8 +5,6 @@ project(RoonVis LANGUAGES C CXX OBJC OBJCXX)
 option(ROONVIS_BUILD_APP "Build the tvOS RoonVis app" ON)
 option(ROONVIS_BUILD_TESTS "Build host-side pure C++ tests" OFF)
 
-set(ROONVIS_DEVELOPMENT_TEAM "" CACHE STRING "Apple Developer Team ID (a free Personal Team is fine)")
-
 if(ROONVIS_BUILD_TESTS)
   add_executable(RoonVisTests
     Sources/RoonVis/PresetShelfModel.h
@@ -24,6 +22,12 @@ if(ROONVIS_BUILD_TESTS)
     Sources/RoonVis/LearnedSlowPresetStore.cpp
     Sources/RoonVis/PreprocessCache.h
     Sources/RoonVis/PreprocessCache.cpp
+    Sources/RoonVis/DeviceTier.h
+    Sources/RoonVis/DeviceTier.cpp
+    Sources/RoonVis/PresetRotationCursor.h
+    Sources/RoonVis/PresetRotationCursor.cpp
+    tests/DeviceTierTests.cpp
+    tests/PresetRotationCursorTests.cpp
     tests/PresetShelfModelTests.cpp
     tests/SnapPCMTests.cpp
     tests/LivePCMDelayBufferTests.cpp
@@ -340,6 +344,12 @@ add_executable(RoonVis MACOSX_BUNDLE
   Sources/RoonVis/PreprocessCache.cpp
   Sources/RoonVis/PresetWarmSettings.h
   Sources/RoonVis/PresetWarmSettings.mm
+  Sources/RoonVis/DeviceTier.h
+  Sources/RoonVis/DeviceTier.cpp
+  Sources/RoonVis/PresetRotationCursor.h
+  Sources/RoonVis/PresetRotationCursor.cpp
+  Sources/RoonVis/RoonVisDeviceTier.h
+  Sources/RoonVis/RoonVisDeviceTier.mm
   Sources/RoonVis/RoonVisCrashReporter.h
   Sources/RoonVis/RoonVisCrashReporter.mm
   Sources/RoonVis/RoonVisPerfCounters.h

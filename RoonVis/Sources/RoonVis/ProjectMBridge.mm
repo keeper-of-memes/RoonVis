@@ -1,5 +1,7 @@
 #import "ProjectMBridgeInternal.h"
 
+#include "PresetRotationCursor.h"
+
 #import "RoonVisCrashReporter.h"
 
 #import <EGL/egl.h>
@@ -297,6 +299,20 @@ unsigned int RoonVisDisplayRefreshRate()
     return refreshRate > 0 ? static_cast<unsigned int>(refreshRate) : 60u;
 }
 
+// projectM's fps hint must track the same effective (capped) rate the display
+// link runs at - both the init and resize paths use this so a resize never
+// reintroduces the uncapped panel rate.
+static unsigned int RoonVisEffectiveProjectMFPS()
+{
+    unsigned int screenMax = RoonVisDisplayRefreshRate();
+    NSInteger cap = [RoonVisSettings sharedSettings].frameRateCap;
+    if (cap > 0 && static_cast<unsigned int>(cap) < screenMax)
+    {
+        return static_cast<unsigned int>(cap);
+    }
+    return screenMax;
+}
+
 void *ProjectMANGLELoadProc(const char *name, void *)
 {
     return reinterpret_cast<void *>(eglGetProcAddress(name));
@@ -367,7 +383,7 @@ void *ProjectMANGLELoadProc(const char *name, void *)
             projectm_free_string(version);
         }
 
-        unsigned int displayRefreshRate = RoonVisDisplayRefreshRate();
+        unsigned int displayRefreshRate = RoonVisEffectiveProjectMFPS();
         // User-adjustable warp mesh (Settings > Rendering > Warp detail; height = width*3/4).
         // The per-vertex warp equations run on the CPU and scale linearly with vertex count,
         // so per-pixel-heavy presets are the most sensitive to this. Milkdrop's default is
@@ -455,7 +471,7 @@ void *ProjectMANGLELoadProc(const char *name, void *)
                        fixedRotationFilenames.size());
         }
         _browsePresetOrderIndexes = [self rotationCandidateIndexesForMode:RoonVisPresetRotationModeLoop];
-        [self regenerateShuffleOrder];
+        [self restoreOrRegenerateShuffleOrder];
         _lastRotationMode = [RoonVisSettings sharedSettings].presetRotationMode;
         RoonVisLog(@"ProjectM hardening: found %zu bundled presets (%lu known slow, %lu known crashing, %lu static-heavy, %lu hidden filtered)",
                    _presetPaths.size(),
@@ -584,7 +600,19 @@ void *ProjectMANGLELoadProc(const char *name, void *)
         [self regenerateShuffleOrder];
     }
     _lastRotationMode = newMode;
-    _browsePresetOrderIndexes = [self rotationCandidateIndexesForMode:RoonVisPresetRotationModeLoop];
+    // Rebuild the browse order only for membership/order-affecting keys; a
+    // missing key (programmatic notification) rebuilds as before. Hygiene only:
+    // the rotation cursor no longer depends on this list staying stable.
+    NSString *changedKey = notification.userInfo[@"key"];
+    const BOOL orderAffecting = changedKey == nil ||
+        [changedKey isEqualToString:RoonVisSettingsHiddenPresetFilenamesKey] ||
+        [changedKey isEqualToString:RoonVisSettingsFavoritePresetFilenamesKey] ||
+        [changedKey isEqualToString:RoonVisSettingsFavoritesOnlyRotationKey] ||
+        [changedKey isEqualToString:RoonVisSettingsPresetRotationModeKey];
+    if (orderAffecting)
+    {
+        _browsePresetOrderIndexes = [self rotationCandidateIndexesForMode:RoonVisPresetRotationModeLoop];
+    }
     [self applySettings];
 }
 
@@ -600,6 +628,18 @@ void *ProjectMANGLELoadProc(const char *name, void *)
     const BOOL perfSweepTiming = RoonVisPerfSweepPresetTimingEnabled();
     double presetDuration = settings.rotationIntervalSeconds;
     double softCutDuration = settings.crossfadeDurationSeconds;
+#if ROONVIS_ENABLE_DIAGNOSTIC_MODES
+    // Burn-in dwell override (dev/QA): rotation interval in seconds, below the
+    // settings floor if needed (e.g. 30 s full-pack passes). Loop coverage comes
+    // from ROONVIS_ROTATION_FIXED_LIST; this only shortens the dwell.
+    {
+        NSString *burninDwell = NSProcessInfo.processInfo.environment[@"ROONVIS_ROTATION_SECONDS"];
+        if (burninDwell.length > 0 && burninDwell.doubleValue > 0.0)
+        {
+            presetDuration = burninDwell.doubleValue;
+        }
+    }
+#endif
     if (perfSweepTiming)
     {
         presetDuration = kPerfSweepPresetDurationSeconds;
@@ -615,6 +655,9 @@ void *ProjectMANGLELoadProc(const char *name, void *)
     _audioSensitivity = settings.audioSensitivity;
     _rotationIntervalSeconds = settings.rotationIntervalSeconds;
     _crossfadeDurationSeconds = settings.crossfadeDurationSeconds;
+    // Live frame-rate cap changes: keep projectM's fps hint in step with the
+    // (capped) display-link rate applied by ANGLEGLView's settings observer.
+    projectm_set_fps(self.projectM, RoonVisEffectiveProjectMFPS());
     // Queue the audio-delay target for the render/GL thread. All writes to the delay
     // ivars (_audioInputDelayMs/_effectiveAudioDelayMs/_audioDelayFrames) happen in
     // -applyPendingAudioDelay on the render thread; the latency lock re-trims the
@@ -704,11 +747,16 @@ void *ProjectMANGLELoadProc(const char *name, void *)
 
 - (std::vector<RoonVis::PresetShelfInput>)presetShelfInputsFavoritesOnly:(BOOL)favoritesOnly
 {
+    return [self presetShelfInputsFavoritesOnly:favoritesOnly includeHidden:NO];
+}
+
+- (std::vector<RoonVis::PresetShelfInput>)presetShelfInputsFavoritesOnly:(BOOL)favoritesOnly includeHidden:(BOOL)includeHidden
+{
     std::vector<RoonVis::PresetShelfInput> inputs;
     for (NSUInteger index = 0; index < [self presetCount]; index++)
     {
         NSString *filename = [self presetFilenameAtIndex:index];
-        if (filename.length == 0 || [self isHidden:filename])
+        if (filename.length == 0 || (!includeHidden && [self isHidden:filename]))
         {
             continue;
         }
@@ -728,6 +776,81 @@ void *ProjectMANGLELoadProc(const char *name, void *)
     return inputs;
 }
 
+static NSString *const kShuffleOrderFilenamesKey = @"RoonVisShuffleOrderFilenames";
+static NSString *const kShuffleOrderFingerprintKey = @"RoonVisShuffleOrderFingerprint";
+
+- (std::string)shuffleOrderFingerprint
+{
+    std::vector<std::string> pack;
+    pack.reserve(_presetPaths.size());
+    for (size_t index = 0; index < _presetPaths.size(); index++)
+    {
+        pack.push_back(RoonVisNSStringToUTF8([self presetDisplayNameForPath:_presetPaths[index]]));
+    }
+    const std::set<std::string> &confirmed = _learnedSlowStore.ConfirmedNames();
+    std::vector<std::string> slow(confirmed.begin(), confirmed.end());
+    return RoonVis::ShuffleOrderFingerprint(pack, slow);
+}
+
+- (void)persistShuffleOrder
+{
+    NSMutableArray<NSString *> *filenames = [NSMutableArray arrayWithCapacity:_shuffleOrderIndexes.size()];
+    for (size_t index : _shuffleOrderIndexes)
+    {
+        if (index < _presetPaths.size())
+        {
+            [filenames addObject:[self presetDisplayNameForPath:_presetPaths[index]]];
+        }
+    }
+    NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+    [defaults setObject:filenames forKey:kShuffleOrderFilenamesKey];
+    [defaults setObject:[NSString stringWithUTF8String:[self shuffleOrderFingerprint].c_str()]
+                 forKey:kShuffleOrderFingerprintKey];
+}
+
+// Restores the persisted shuffle permutation when its fingerprint (pack filename
+// set + learned-slow confirmed set) still matches; otherwise reseeds. Entries
+// hidden or runtime-slow-marked are RETAINED in the order and filtered by the
+// advance predicate, so short sessions continue the walk across launches
+// instead of resampling the head of a fresh permutation every time.
+- (void)restoreOrRegenerateShuffleOrder
+{
+    NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+    NSString *storedFingerprint = [defaults stringForKey:kShuffleOrderFingerprintKey];
+    NSArray *storedOrder = [defaults arrayForKey:kShuffleOrderFilenamesKey];
+    if (storedFingerprint.length > 0 && [storedOrder isKindOfClass:NSArray.class] && storedOrder.count > 0 &&
+        [self shuffleOrderFingerprint] == RoonVisNSStringToUTF8(storedFingerprint))
+    {
+        std::vector<std::string> stored;
+        stored.reserve(storedOrder.count);
+        for (id item in storedOrder)
+        {
+            if ([item isKindOfClass:NSString.class])
+            {
+                stored.push_back(RoonVisNSStringToUTF8(static_cast<NSString *>(item)));
+            }
+        }
+        std::vector<size_t> restored = RoonVis::RestoreShuffleOrder(stored, [self](const std::string &filename) {
+            NSString *name = [NSString stringWithUTF8String:filename.c_str()];
+            for (size_t index = 0; index < self->_presetPaths.size(); index++)
+            {
+                if ([[self presetDisplayNameForPath:self->_presetPaths[index]] isEqualToString:name])
+                {
+                    return index;
+                }
+            }
+            return static_cast<size_t>(SIZE_MAX);
+        });
+        if (!restored.empty())
+        {
+            _shuffleOrderIndexes = std::move(restored);
+            RoonVisLog(@"ProjectM rotation: restored persisted shuffle order (%zu entries)", _shuffleOrderIndexes.size());
+            return;
+        }
+    }
+    [self regenerateShuffleOrder];
+}
+
 - (void)regenerateShuffleOrder
 {
     std::vector<size_t> visible;
@@ -741,6 +864,7 @@ void *ProjectMANGLELoadProc(const char *name, void *)
         }
     }
     _shuffleOrderIndexes = RoonVis::ShuffledOrder(visible, arc4random());
+    [self persistShuffleOrder];
     RoonVisLog(@"ProjectM settings: shuffle order reseeded (%zu presets)", _shuffleOrderIndexes.size());
 }
 
@@ -789,6 +913,49 @@ void *ProjectMANGLELoadProc(const char *name, void *)
     return indexes;
 }
 
+- (std::vector<size_t>)fullRotationOrderForMode:(RoonVisPresetRotationMode)mode
+{
+    if (_presetPaths.empty())
+    {
+        return {};
+    }
+
+    if (mode == RoonVisPresetRotationModeShuffle)
+    {
+        if (_shuffleOrderIndexes.empty())
+        {
+            [self regenerateShuffleOrder];
+        }
+        // The raw permutation, unfiltered: entries hidden or slow-marked since
+        // the seed stay in place and are skipped by the advance predicate.
+        return _shuffleOrderIndexes;
+    }
+
+    std::vector<RoonVis::PresetShelfInput> inputs = [self presetShelfInputsFavoritesOnly:(mode == RoonVisPresetRotationModeFavorites) includeHidden:YES];
+    std::vector<RoonVis::PresetShelf> shelves = RoonVis::BuildPresetShelves(inputs, mode == RoonVisPresetRotationModeFavorites, 3);
+    std::vector<size_t> indexes = RoonVis::FlattenPresetShelfIndexes(shelves);
+    if (mode == RoonVisPresetRotationModeFavorites && indexes.empty())
+    {
+        RoonVisLog(@"ProjectM settings: favourites rotation requested but no favourites exist; using Loop rotation");
+        inputs = [self presetShelfInputsFavoritesOnly:NO includeHidden:YES];
+        shelves = RoonVis::BuildPresetShelves(inputs, false, 3);
+        indexes = RoonVis::FlattenPresetShelfIndexes(shelves);
+    }
+    return indexes;
+}
+
+- (size_t)rotationAnchorIndex
+{
+    // While a load is in flight (requested differs from confirmed), anchor on
+    // the requested preset so rotation advance and warm-preload candidates
+    // agree on where the walk continues from.
+    if (_currentPresetIndex != SIZE_MAX && _currentPresetIndex != _confirmedPresetIndex)
+    {
+        return _currentPresetIndex;
+    }
+    return _confirmedPresetIndex != SIZE_MAX ? _confirmedPresetIndex : _currentPresetIndex;
+}
+
 - (size_t)nextRotationIndexFrom:(size_t)index offset:(NSInteger)offset
 {
     if (_presetPaths.empty())
@@ -800,42 +967,38 @@ void *ProjectMANGLELoadProc(const char *name, void *)
     RoonVisPresetRotationMode mode = settings.presetRotationMode;
     // Debug determinism hook: a fixed list overrides mode and skips the hidden/slow
     // filter (listed presets rotate regardless; always empty in Release).
-    std::vector<size_t> candidates = _fixedRotationIndexes;
-    if (candidates.empty())
+    std::vector<size_t> order = _fixedRotationIndexes;
+    std::function<bool(size_t)> excluded;
+    if (!order.empty())
     {
-        candidates = mode == RoonVisPresetRotationModeLoop ? _browsePresetOrderIndexes : [self rotationCandidateIndexesForMode:mode];
-        candidates.erase(std::remove_if(candidates.begin(), candidates.end(), [self](size_t candidateIndex) {
+        excluded = [self](size_t candidateIndex) {
+            return candidateIndex >= self->_presetPaths.size();
+        };
+    }
+    else
+    {
+        // The FULL mode order (hidden/slow entries retained) + an exclusion
+        // predicate. The cursor continues from the anchor's order position even
+        // when the anchor itself was just hidden or slow-marked; the historical
+        // filtered-list search reset to the front in that case, looping the head
+        // of the pack and starving the tail.
+        order = [self fullRotationOrderForMode:mode];
+        excluded = [self](size_t candidateIndex) {
             if (candidateIndex >= self->_presetPaths.size())
             {
                 return true;
             }
             NSString *presetName = [self presetDisplayNameForPath:self->_presetPaths[candidateIndex]];
-            return [self isPresetHiddenOrSlow:presetName];
-        }), candidates.end());
+            return static_cast<bool>([self isPresetHiddenOrSlow:presetName]);
+        };
     }
-    if (candidates.empty())
+    if (order.empty())
     {
         return SIZE_MAX;
     }
 
-    NSInteger currentPosition = -1;
-    for (size_t position = 0; position < candidates.size(); position++)
-    {
-        if (candidates[position] == index)
-        {
-            currentPosition = static_cast<NSInteger>(position);
-            break;
-        }
-    }
-
-    if (currentPosition < 0)
-    {
-        return offset < 0 ? candidates.back() : candidates.front();
-    }
-
-    NSInteger candidateCount = static_cast<NSInteger>(candidates.size());
-    NSInteger nextPosition = (currentPosition + offset + candidateCount) % candidateCount;
-    return candidates[static_cast<size_t>(nextPosition)];
+    RoonVis::RotationAdvanceResult advance = RoonVis::AdvanceRotationCursor(order, index, offset, excluded);
+    return advance.valid ? advance.index : SIZE_MAX;
 }
 
 - (void)dealloc
@@ -865,7 +1028,7 @@ void *ProjectMANGLELoadProc(const char *name, void *)
 
     size_t width = static_cast<size_t>(std::max<CGFloat>(1, drawableSize.width));
     size_t height = static_cast<size_t>(std::max<CGFloat>(1, drawableSize.height));
-    projectm_set_fps(self.projectM, RoonVisDisplayRefreshRate());
+    projectm_set_fps(self.projectM, RoonVisEffectiveProjectMFPS());
     [self invalidatePreloadedPresetTracking];
     projectm_set_window_size(self.projectM, width, height);
 }

@@ -1,5 +1,7 @@
 #import <Foundation/Foundation.h>
 
+#import "RoonVisDeviceTier.h"
+
 NS_ASSUME_NONNULL_BEGIN
 
 typedef NS_ENUM(NSInteger, RoonVisTransitionStyle) {
@@ -27,6 +29,8 @@ FOUNDATION_EXPORT NSString *const RoonVisSettingsFavoritesOnlyRotationKey;
 FOUNDATION_EXPORT NSString *const RoonVisSettingsDiagnosticsOverlayEnabledKey;
 FOUNDATION_EXPORT NSString *const RoonVisSettingsFavoritePresetFilenamesKey;
 FOUNDATION_EXPORT NSString *const RoonVisSettingsHiddenPresetFilenamesKey;
+FOUNDATION_EXPORT NSString *const RoonVisSettingsFrameRateCapKey;
+FOUNDATION_EXPORT NSString *const RoonVisSettingsDrawableSizePresetKey;
 
 @interface RoonVisSettings : NSObject
 
@@ -42,6 +46,13 @@ FOUNDATION_EXPORT NSString *const RoonVisSettingsHiddenPresetFilenamesKey;
 // 48..128 (see kWarpMeshWidth* in the .mm); 128 is the ceiling.
 @property(nonatomic, assign) NSInteger warpMeshWidth;
 @property(nonatomic, assign, getter=isDiagnosticsOverlayEnabled) BOOL diagnosticsOverlayEnabled;
+// Frame-rate cap for the render display link, snapped to {25, 30, 50, 60}. The
+// effective rate is min(screen max, cap); 25/50 only land exactly on 50 Hz
+// output modes. Tier default: HD 30, everything else 60.
+@property(nonatomic, assign) NSInteger frameRateCap;
+// Render-target size preset, clamped on read AND write to the device tier's
+// maximum (Apple TV HD tops out at 1080p). Tier default: HD 720p, others 1080p.
+@property(nonatomic, assign) RoonVisDrawableSizePreset drawableSizePreset;
 @property(nonatomic, copy) NSSet<NSString *> *favoritePresetFilenames;
 @property(nonatomic, copy) NSSet<NSString *> *hiddenPresetFilenames;
 

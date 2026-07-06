@@ -308,6 +308,12 @@ static NSInteger RoonVisDisplayRefreshRate(UIView *view)
 
 - (void)recordPresetRenderDuration:(CFTimeInterval)renderDuration
 {
+    // Scale the slow threshold with the capped frame rate: 80 ms is ~5 frames
+    // at 60 fps but only 2 at 25 fps, so a fixed threshold over-triggers under
+    // low caps. Two missed frame periods is the equivalent yardstick.
+    const NSInteger effectiveFrameRate = RoonVisEffectiveFrameRate(self);
+    const CFTimeInterval frameDuration = effectiveFrameRate > 0 ? 1.0 / static_cast<CFTimeInterval>(effectiveFrameRate) : 1.0 / 60.0;
+    const CFTimeInterval slowThresholdSeconds = MAX(kSlowPresetRenderSeconds, 2.0 * frameDuration);
     NSString *presetName = self.projectMBridge.confirmedPresetName ?: self.projectMBridge.requestedPresetName ?: @"";
     if ([self.projectMBridge consumeWarmedFirstActivationForPresetName:presetName])
     {
@@ -319,7 +325,7 @@ static NSInteger RoonVisDisplayRefreshRate(UIView *view)
                                       renderDuration * 1000.0];
         return;
     }
-    if (presetName.length == 0 || renderDuration <= kSlowPresetRenderSeconds)
+    if (presetName.length == 0 || renderDuration <= slowThresholdSeconds)
     {
         _slowPresetFrameCount = 0;
         [_slowPresetName release];

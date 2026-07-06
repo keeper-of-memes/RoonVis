@@ -184,6 +184,79 @@ final class RoonVisUITests: XCTestCase {
         )
     }
 
+    /// Settings rows: the Frame rate and Render quality segment rows exist and
+    /// respond to remote stepping. In RVSegmentRow focus IS selection (moving
+    /// focus onto a pill selects it), so asserting the focused pill changed
+    /// also proves the underlying setting changed.
+    func testRenderingSettingsRowsStep() throws {
+        let app = launchRoonVis()
+
+        // Open Browse, then retreat focus to the pill tab bar.
+        XCUIRemote.shared.press(.menu)
+        XCTAssertTrue(
+            waitForElement(named: "Settings", in: app, timeout: 10),
+            "Expected Browse to open with the Settings tab pill."
+        )
+        pause(2)
+        XCUIRemote.shared.press(.menu)
+        XCTAssertTrue(
+            waitForFocusedPill(in: app, timeout: 5),
+            "Expected a pill tab to be focused after the Menu retreat."
+        )
+
+        // Walk right until the Settings pill has focus (tab switches with focus).
+        var hops = 0
+        while !(app.buttons["Settings"].exists && app.buttons["Settings"].hasFocus) && hops < 4 {
+            XCUIRemote.shared.press(.right)
+            pause(0.5)
+            hops += 1
+        }
+        XCTAssertTrue(app.buttons["Settings"].hasFocus, "Expected the Settings pill to gain focus.")
+        pause(1)
+
+        // Descend through the settings rows until a frame-rate pill has focus.
+        let frameRateLabels = ["25", "30", "50", "60"]
+        var downs = 0
+        while focusedLabel(among: frameRateLabels, in: app) == nil && downs < 20 {
+            XCUIRemote.shared.press(.down)
+            pause(0.4)
+            downs += 1
+        }
+        let initialRate = focusedLabel(among: frameRateLabels, in: app)
+        XCTAssertNotNil(initialRate, "Expected a Frame rate pill to take focus while descending Settings.")
+
+        // Step the frame-rate row: focus (= selection) must land on a different value.
+        XCUIRemote.shared.press(initialRate == "60" ? .left : .right)
+        pause(0.6)
+        let steppedRate = focusedLabel(among: frameRateLabels, in: app)
+        XCTAssertNotNil(steppedRate, "Expected focus to remain on a Frame rate pill after stepping.")
+        XCTAssertNotEqual(steppedRate, initialRate, "Expected stepping to select a different frame rate.")
+
+        // Next row down is Render quality; step it the same way.
+        let qualityLabels = ["720p", "1080p", "1440p", "4K"]
+        downs = 0
+        while focusedLabel(among: qualityLabels, in: app) == nil && downs < 4 {
+            XCUIRemote.shared.press(.down)
+            pause(0.4)
+            downs += 1
+        }
+        let initialQuality = focusedLabel(among: qualityLabels, in: app)
+        XCTAssertNotNil(initialQuality, "Expected a Render quality pill to take focus below Frame rate.")
+
+        XCUIRemote.shared.press(initialQuality == "4K" ? .left : .right)
+        pause(1.0)   // surface recreation happens on this change; give it a beat
+        let steppedQuality = focusedLabel(among: qualityLabels, in: app)
+        XCTAssertNotNil(steppedQuality, "Expected focus to remain on a Render quality pill after stepping.")
+        XCTAssertNotEqual(steppedQuality, initialQuality, "Expected stepping to select a different render quality.")
+    }
+
+    private func focusedLabel(among labels: [String], in app: XCUIApplication) -> String? {
+        labels.first { name in
+            let button = app.buttons[name]
+            return button.exists && button.hasFocus
+        }
+    }
+
     /// RunLoop-based wait (keeps the XCTest run loop live, unlike `sleep`).
     private func pause(_ seconds: TimeInterval) {
         RunLoop.current.run(until: Date().addingTimeInterval(seconds))

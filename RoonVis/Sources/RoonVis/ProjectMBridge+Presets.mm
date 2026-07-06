@@ -240,7 +240,7 @@ static NSString *const kLastShownPresetFilenameKey = @"RoonVisLastShownPresetFil
     }
 
     _lastGoodPresetIndex = _confirmedPresetIndex;
-    size_t nextIndex = [self nextRotationIndexFrom:_currentPresetIndex offset:offset];
+    size_t nextIndex = [self nextRotationIndexFrom:[self rotationAnchorIndex] offset:offset];
     if (nextIndex != SIZE_MAX && nextIndex < _presetPaths.size())
     {
         const std::string &path = _presetPaths[nextIndex];

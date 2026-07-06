@@ -20,6 +20,8 @@ void RunPresetRotationSchedulerTests();
 void RunPresetWarmCacheTests();
 void RunLearnedSlowPresetStoreTests();
 void RunPreprocessCacheTests();
+void RunDeviceTierTests();
+void RunPresetRotationCursorTests();
 
 namespace
 {
@@ -455,6 +457,8 @@ int main()
     RunPresetWarmCacheTests();
     RunLearnedSlowPresetStoreTests();
     RunPreprocessCacheTests();
+    RunDeviceTierTests();
+    RunPresetRotationCursorTests();
 
     std::printf("RoonVisTests: %d passed, %d failed\n", Stats().passed, Stats().failed);
     return Stats().failed == 0 ? 0 : 1;

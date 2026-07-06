@@ -232,7 +232,7 @@ static NSString *const kClearLearnedSlowPresetsKey = @"RoonVisClearLearnedSlowPr
     candidates.reserve(candidateDepth);
     for (size_t offset = 1; offset <= candidateDepth; offset++)
     {
-        size_t nextIndex = [self nextRotationIndexFrom:_confirmedPresetIndex offset:static_cast<NSInteger>(offset)];
+        size_t nextIndex = [self nextRotationIndexFrom:[self rotationAnchorIndex] offset:static_cast<NSInteger>(offset)];
         if (nextIndex == SIZE_MAX || nextIndex >= _presetPaths.size() || nextIndex == _confirmedPresetIndex)
         {
             break;
@@ -334,7 +334,7 @@ static NSString *const kClearLearnedSlowPresetsKey = @"RoonVisClearLearnedSlowPr
     {
         return NO;
     }
-    size_t nextIndex = [self nextRotationIndexFrom:_confirmedPresetIndex offset:1];
+    size_t nextIndex = [self nextRotationIndexFrom:[self rotationAnchorIndex] offset:1];
     return nextIndex == candidate.index &&
            nextIndex < _presetPaths.size() &&
            _presetPaths[nextIndex] == candidate.path;
