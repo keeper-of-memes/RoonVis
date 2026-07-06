@@ -1,6 +1,6 @@
 # Third-party licenses
 
-RoonVis's own source is licensed under **GPL-3.0** (see [`LICENSE`](LICENSE)). It bundles and
+RoonVis's own source is licensed under **MIT** (see [`LICENSE`](LICENSE)). It bundles and
 builds on the following third-party components, each under its own license:
 
 | Component | Where | License | Notes |
@@ -39,9 +39,10 @@ Provenance and links are in [`RoonVis/Resources/presets/SOURCE.md`](RoonVis/Reso
 
 We wrote no presets — they are borrowed and redistributed under their public-domain status.
 
-## A note on GPL-3.0 + the App Store
+## A note on licensing + the App Store
 
-GPL-3.0 is compatible with distributing RoonVis's **source** here and with **sideloading** a build
-onto your own Apple TV. It is **not** compatible with Apple App Store distribution (the App Store
-terms conflict with the GPL). RoonVis is sideload-only today, so this is not a practical constraint —
-but a future App Store path would require relicensing.
+RoonVis's own MIT license is compatible with source distribution, sideloading, and App Store
+distribution alike. The remaining consideration for any binary distribution (including a future
+App Store build) is **libprojectM's LGPL-2.1**: the compliance measures above (public sources,
+patches, and a relinkable dynamic framework) apply to those builds too. RoonVis is sideload-only
+today.

@@ -75,9 +75,9 @@ troubleshooting, FAQ, and known issues. Start at the [Home](../../wiki) page.
 
 ## License
 
-RoonVis's own source is **GPL-3.0** (see [`LICENSE`](LICENSE)). It builds on **libprojectM** (LGPL-2.1,
+RoonVis's own source is **MIT** (see [`LICENSE`](LICENSE)). It builds on **libprojectM** (LGPL-2.1,
 patched — sources shipped as submodule + `RoonVis/patches/`), **ANGLE** (BSD-3-Clause), and
 public-domain Milkdrop presets/textures. Full inventory: [`THIRD_PARTY.md`](THIRD_PARTY.md).
 
-> GPL-3.0 is fine for source distribution and sideloading, but is **incompatible with App Store
-> distribution** — RoonVis is sideload-only today.
+> RoonVis is sideload-only today. Note that any binary distribution also carries **libprojectM's
+> LGPL-2.1 terms** — see [`THIRD_PARTY.md`](THIRD_PARTY.md) for how we comply.
