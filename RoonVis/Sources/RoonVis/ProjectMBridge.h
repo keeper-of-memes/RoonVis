@@ -28,6 +28,29 @@ FOUNDATION_EXPORT NSNotificationName const RoonVisEngineStateDidChangeNotificati
 @property(nonatomic, readonly) NSInteger effectiveAudioDelayMs;
 - (void)setEffectiveAudioDelayMs:(NSInteger)effectiveAudioDelayMs;
 
+// --- Sync calibration (all main/GL thread; asserted) ---
+// True while live Snapcast PCM is flowing (enqueue within the last 3 s) - the
+// calibration entry gate. Never true for the bundled-WAV fallback.
+@property(nonatomic, readonly) BOOL isLivePCMActive;
+@property(nonatomic, readonly) BOOL syncCalibrationActive;
+@property(nonatomic, readonly) NSInteger syncCalibrationDelayMs;
+// Set when the onset detector fired within the samples consumed this frame;
+// cleared at the start of each renderFrame.
+@property(nonatomic, readonly) BOOL syncCalibrationOnsetThisFrame;
+// Internal render compensation the latency lock adds on top of the user-visible
+// delay setting (kept out of Settings/toasts by design - the user sees the
+// number they aligned by ear).
+@property(nonatomic, readonly) NSInteger syncRenderCompensationMs;
+// Stashes target+effective delay and the rotation-hold state, holds rotation,
+// pins the effective delay to the draft, resets the onset detector.
+- (void)beginSyncCalibration;
+// Live nudge: pins target == effective == ms (clamped 0-500) and rebases.
+- (void)setSyncCalibrationDelayMs:(NSInteger)ms;
+// Ends calibration. save=YES persists the render-compensated target computed
+// from the caller-supplied running lock averages (see SyncCalibrationMath);
+// save=NO restores the dual stash. Rotation-hold state is restored either way.
+- (void)endSyncCalibrationSaving:(BOOL)save avgRenderMs:(double)avgRenderMs avgSwapMs:(double)avgSwapMs;
+
 - (instancetype)initWithDrawableSize:(CGSize)drawableSize;
 - (void)resizeToDrawableSize:(CGSize)drawableSize;
 - (void)enqueueLivePCMInt16:(const int16_t *)interleaved frameCount:(NSUInteger)frameCount;

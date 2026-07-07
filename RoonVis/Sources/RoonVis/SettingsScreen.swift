@@ -18,6 +18,9 @@ enum SettingsRanges {
 struct SettingsScreenView: View {
     @ObservedObject var settings: SettingsStore
     @ObservedObject var engine: EngineState
+    var onCalibrateSync: () -> Void = {}
+    @State private var isEditingHost = false
+    @State private var hostDraft = ""
 
     var body: some View {
         ScrollView {
@@ -89,12 +92,27 @@ struct SettingsScreenView: View {
                     RVStepperRow(
                         systemImage: "metronome",
                         title: "Audio sync delay",
-                        description: "Delay the visualizer's audio input so you can match it by delaying the audio to your amp/streamer.",
+                        description: "How long the visualizer waits before reacting. Use Calibrate sync below to set this by ear; manual adjustment is optional.",
                         value: audioDelayBinding,
                         range: SettingsRanges.audioInputDelay,
                         step: SettingsRanges.audioInputDelayStep,
                         formatter: formatMilliseconds
                     )
+
+                    RVFocusRow(
+                        systemImage: "metronome.fill",
+                        title: "Calibrate sync",
+                        description: "Play rhythmic music, then nudge until the on-screen pulse matches what you hear. Calibrates your whole chain, including the TV.",
+                        action: { onCalibrateSync() }
+                    ) {
+                        Text("Start")
+                            .font(RVTheme.Fonts.caption.weight(.semibold))
+                            .foregroundStyle(RVTheme.Colors.primaryText)
+                            .padding(.horizontal, RVTheme.Spacing.m)
+                            .frame(height: 54)
+                            .background(RVTheme.Colors.accent, in: Capsule())
+                    }
+                    .accessibilityHint("Press Select to start sync calibration")
                 }
 
                 GlassPanel(title: "Rendering") {
@@ -123,6 +141,23 @@ struct SettingsScreenView: View {
                         step: SettingsRanges.warpMeshStep,
                         formatter: formatMesh
                     )
+                }
+
+                GlassPanel(title: "Connection") {
+                    RVFocusRow(
+                        systemImage: "network",
+                        title: "Snapcast server",
+                        description: "The Snapcast server that streams audio to the visualizer. IP address or hostname.",
+                        action: {
+                            hostDraft = settings.snapcastServerHost
+                            isEditingHost = true
+                        }
+                    ) {
+                        Text(settings.snapcastServerHost)
+                            .font(RVTheme.Fonts.caption.monospaced())
+                            .foregroundStyle(RVTheme.Colors.secondaryText)
+                    }
+                    .accessibilityHint("Press Select to edit the server address")
                 }
 
                 GlassPanel(title: "Diagnostics") {
@@ -167,6 +202,15 @@ struct SettingsScreenView: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(Color.clear)
+        .alert("Snapcast server", isPresented: $isEditingHost) {
+            TextField("IP address or hostname", text: $hostDraft)
+                .textInputAutocapitalization(.never)
+                .autocorrectionDisabled()
+            Button("Save") { settings.snapcastServerHost = hostDraft }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("The visualizer reconnects immediately after saving. Clearing the field restores the built-in default.")
+        }
     }
 
     private var sortedHiddenFilenames: [String] {

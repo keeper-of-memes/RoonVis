@@ -58,6 +58,13 @@ struct PendingBytesResult
 
 PendingBytesResult DecidePendingBytes(const uint8_t *bytes, size_t length);
 
+// Normalizes a user-entered Snapcast host: trims ASCII whitespace and rejects
+// strings with embedded whitespace or control characters (returns empty, which
+// callers treat as "fall back to the default"). Accepts IPv4/IPv6 literals and
+// hostnames without further validation - connection errors surface at connect
+// time with clearer diagnostics than a rejected string would.
+std::string NormalizeSnapcastHost(const std::string &input);
+
 enum class WireChunkResult
 {
     Enqueue,

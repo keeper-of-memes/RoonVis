@@ -338,6 +338,8 @@ void *ProjectMANGLELoadProc(const char *name, void *)
         _presetStepDirection = 1;
         _audioInputDelayMs = 255;
         _effectiveAudioDelayMs = _audioInputDelayMs;
+        _syncRenderCompensationMs = [[NSUserDefaults standardUserDefaults] integerForKey:@"RoonVisSyncRenderCompensationMs"];
+        _syncRenderCompensationMs = MAX((NSInteger)0, MIN((NSInteger)200, _syncRenderCompensationMs));
         _audioDelayFrames = LivePCMDelayFramesForMilliseconds(_audioInputDelayMs);
         _audioSensitivity = 1.0;
         _transitionStyle = RoonVisTransitionStyleInstant;

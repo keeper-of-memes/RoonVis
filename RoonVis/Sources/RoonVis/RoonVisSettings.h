@@ -31,6 +31,7 @@ FOUNDATION_EXPORT NSString *const RoonVisSettingsFavoritePresetFilenamesKey;
 FOUNDATION_EXPORT NSString *const RoonVisSettingsHiddenPresetFilenamesKey;
 FOUNDATION_EXPORT NSString *const RoonVisSettingsFrameRateCapKey;
 FOUNDATION_EXPORT NSString *const RoonVisSettingsDrawableSizePresetKey;
+FOUNDATION_EXPORT NSString *const RoonVisSettingsSnapcastServerHostKey;
 
 @interface RoonVisSettings : NSObject
 
@@ -53,6 +54,10 @@ FOUNDATION_EXPORT NSString *const RoonVisSettingsDrawableSizePresetKey;
 // Render-target size preset, clamped on read AND write to the device tier's
 // maximum (Apple TV HD tops out at 1080p). Tier default: HD 720p, others 1080p.
 @property(nonatomic, assign) RoonVisDrawableSizePreset drawableSizePreset;
+// Snapcast server host (IP or hostname). Defaults to the Info.plist
+// SnapcastServerHost value; a cleared or invalid entry falls back to it.
+// Normalized (trimmed, no embedded whitespace) on read and write.
+@property(nonatomic, copy) NSString *snapcastServerHost;
 @property(nonatomic, copy) NSSet<NSString *> *favoritePresetFilenames;
 @property(nonatomic, copy) NSSet<NSString *> *hiddenPresetFilenames;
 

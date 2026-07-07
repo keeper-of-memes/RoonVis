@@ -22,6 +22,7 @@ void RunLearnedSlowPresetStoreTests();
 void RunPreprocessCacheTests();
 void RunDeviceTierTests();
 void RunPresetRotationCursorTests();
+void RunAudioOnsetDetectorTests();
 
 namespace
 {
@@ -436,6 +437,18 @@ void TestShuffledOrder()
     CHECK(ShuffledOrder(single, 7) == single);
 }
 
+void TestNormalizeSnapcastHost()
+{
+    CHECK(NormalizeSnapcastHost("192.168.1.10") == "192.168.1.10");
+    CHECK(NormalizeSnapcastHost("  myserver.local\n") == "myserver.local");
+    CHECK(NormalizeSnapcastHost("\t 2001:db8::1 ") == "2001:db8::1");
+    CHECK(NormalizeSnapcastHost("") == "");
+    CHECK(NormalizeSnapcastHost("   ") == "");
+    CHECK(NormalizeSnapcastHost("bad host") == "");     // embedded space
+    CHECK(NormalizeSnapcastHost("bad\thost") == "");    // embedded tab
+    CHECK(NormalizeSnapcastHost(std::string("bad\x01host")) == ""); // control char
+}
+
 }  // namespace
 
 int main()
@@ -450,6 +463,7 @@ int main()
     TestRingBuffer();
     TestBackoff();
     TestShuffledOrder();
+    TestNormalizeSnapcastHost();
     RunPresetShelfModelTests();
     RunPresetBlocklistTests();
     RunLivePCMDelayBufferTests();
@@ -459,6 +473,7 @@ int main()
     RunPreprocessCacheTests();
     RunDeviceTierTests();
     RunPresetRotationCursorTests();
+    RunAudioOnsetDetectorTests();
 
     std::printf("RoonVisTests: %d passed, %d failed\n", Stats().passed, Stats().failed);
     return Stats().failed == 0 ? 0 : 1;

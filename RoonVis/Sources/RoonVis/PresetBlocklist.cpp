@@ -309,6 +309,13 @@ bool ParsePresetBlocklistJSON(const char *bytes, size_t length, PresetBlocklists
             }
             sawStaticHeavy = true;
         }
+        else if (key == "learnedSlowSeedHD")
+        {
+            if (!ParseStringArray(text, offset, out.learnedSlowSeedHD))
+            {
+                return false;
+            }
+        }
         else
         {
             std::unordered_set<std::string> ignored;

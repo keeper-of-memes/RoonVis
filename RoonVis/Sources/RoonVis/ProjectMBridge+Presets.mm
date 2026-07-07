@@ -190,10 +190,19 @@ static NSString *const kLastShownPresetFilenameKey = @"RoonVisLastShownPresetFil
     const bool inFixedRotationList =
         std::find(_fixedRotationIndexes.begin(), _fixedRotationIndexes.end(), static_cast<size_t>(index)) !=
         _fixedRotationIndexes.end();
+    if (!inFixedRotationList && [self isHidden:presetName])
+    {
+        RoonVisLog(@"ProjectM hardening: refusing direct load of hidden preset %@", presetName);
+        return NO;
+    }
     if (!inFixedRotationList && [self isPresetHiddenOrSlow:presetName])
     {
-        RoonVisLog(@"ProjectM hardening: refusing direct load of hidden/slow preset %@", presetName);
-        return NO;
+        // Slow-marked presets stay visible in Browse; a DIRECT user selection
+        // overrides the automatic exclusion (previously this refused silently:
+        // Browse dismissed, nothing loaded, and the next rotation advance
+        // looked like the app "opened the next preset instead"). The slow-skip
+        // machinery still applies if it renders catastrophically again.
+        RoonVisLog(@"ProjectM hardening: user override - direct load of slow-marked preset %@", presetName);
     }
 
     _lastGoodPresetIndex = _confirmedPresetIndex;

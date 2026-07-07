@@ -15,6 +15,7 @@ struct BrowseModalView: View {
     let onToggleFavorite: (Int) -> Void
     let onHidePreset: (Int) -> Void
     let onDismiss: () -> Void
+    let onCalibrateSync: () -> Void
     let onSelectedTabChange: (BrowseModalTab) -> Void
 
     @State private var selectedTab: BrowseModalTab
@@ -33,6 +34,7 @@ struct BrowseModalView: View {
         onToggleFavorite: @escaping (Int) -> Void,
         onHidePreset: @escaping (Int) -> Void,
         onDismiss: @escaping () -> Void,
+        onCalibrateSync: @escaping () -> Void = {},
         onSelectedTabChange: @escaping (BrowseModalTab) -> Void = { _ in }
     ) {
         self.engine = engine
@@ -41,6 +43,7 @@ struct BrowseModalView: View {
         self.onToggleFavorite = onToggleFavorite
         self.onHidePreset = onHidePreset
         self.onDismiss = onDismiss
+        self.onCalibrateSync = onCalibrateSync
         self.onSelectedTabChange = onSelectedTabChange
         _selectedTab = State(initialValue: initialTab)
     }
@@ -88,7 +91,7 @@ struct BrowseModalView: View {
                             initialFocusGrab: $needsInitialPresetFocus
                         )
                     case .settings:
-                        SettingsScreenView(settings: settings, engine: engine)
+                        SettingsScreenView(settings: settings, engine: engine, onCalibrateSync: onCalibrateSync)
                     }
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -140,6 +143,7 @@ private struct BrowseModalRootView: View {
     let onToggleFavorite: (Int) -> Void
     let onHidePreset: (Int) -> Void
     let onDismiss: () -> Void
+    let onCalibrateSync: () -> Void
     let onSelectedTabChange: (BrowseModalTab) -> Void
     let initialTab: BrowseModalTab
 
@@ -151,6 +155,7 @@ private struct BrowseModalRootView: View {
         onToggleFavorite: @escaping (Int) -> Void,
         onHidePreset: @escaping (Int) -> Void,
         onDismiss: @escaping () -> Void,
+        onCalibrateSync: @escaping () -> Void = {},
         onSelectedTabChange: @escaping (BrowseModalTab) -> Void
     ) {
         _settings = StateObject(wrappedValue: settings)
@@ -160,6 +165,7 @@ private struct BrowseModalRootView: View {
         self.onToggleFavorite = onToggleFavorite
         self.onHidePreset = onHidePreset
         self.onDismiss = onDismiss
+        self.onCalibrateSync = onCalibrateSync
         self.onSelectedTabChange = onSelectedTabChange
     }
 
@@ -172,6 +178,7 @@ private struct BrowseModalRootView: View {
             onToggleFavorite: onToggleFavorite,
             onHidePreset: onHidePreset,
             onDismiss: onDismiss,
+            onCalibrateSync: onCalibrateSync,
             onSelectedTabChange: onSelectedTabChange
         )
     }
@@ -211,6 +218,9 @@ private struct BrowseModalRootView: View {
                 },
                 onDismiss: {
                     glView.dismissBrowseFromUI()
+                },
+                onCalibrateSync: {
+                    glView.presentSyncCalibrationFromUI()
                 },
                 onSelectedTabChange: { tab in
                     environment.lastBrowseTab = tab

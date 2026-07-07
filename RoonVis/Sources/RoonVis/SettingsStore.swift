@@ -47,6 +47,10 @@ final class SettingsStore: ObservableObject {
         get { previewValues?.drawableSizePreset ?? settings.drawableSizePreset }
         set { write(\.drawableSizePreset, newValue) { settings.drawableSizePreset = newValue } }
     }
+    var snapcastServerHost: String {
+        get { previewValues?.snapcastServerHost ?? settings.snapcastServerHost }
+        set { write(\.snapcastServerHost, newValue) { settings.snapcastServerHost = newValue } }
+    }
     var favoritePresetFilenames: Set<String> {
         get { previewValues?.favoritePresetFilenames ?? Set(settings.favoritePresetFilenames) }
         set { write(\.favoritePresetFilenames, newValue) { settings.favoritePresetFilenames = newValue } }
@@ -127,6 +131,7 @@ private struct PreviewValues {
     var diagnosticsOverlayEnabled: Bool
     var frameRateCap: Int
     var drawableSizePreset: RoonVisDrawableSizePreset
+    var snapcastServerHost: String
     var favoritePresetFilenames: Set<String>
     var hiddenPresetFilenames: Set<String>
 
@@ -142,6 +147,7 @@ private struct PreviewValues {
         diagnosticsOverlayEnabled = settings.isDiagnosticsOverlayEnabled
         frameRateCap = settings.frameRateCap
         drawableSizePreset = settings.drawableSizePreset
+        snapcastServerHost = settings.snapcastServerHost
         favoritePresetFilenames = Set(settings.favoritePresetFilenames)
         hiddenPresetFilenames = Set(settings.hiddenPresetFilenames)
     }
@@ -166,6 +172,7 @@ extension SettingsStore {
         store.diagnosticsOverlayEnabled = diagnosticsEnabled
         store.frameRateCap = 60
         store.drawableSizePreset = .preset1080p
+        store.snapcastServerHost = "192.0.2.10"
         store.favoritePresetFilenames = ["milkdrop-preview-01.milk", "milkdrop-preview-03.milk"]
         store.hiddenPresetFilenames = []
         return store

@@ -328,6 +328,116 @@ static NSString * const kVisualizerHintSeenDefaultsKey = @"RoonVisVisualizerCont
     [self dismissBrowse];
 }
 
+// Sync calibration entry. Exact order (review-mandated): dismiss Browse ->
+// unpause the display link -> gate on live PCM -> beginSyncCalibration ->
+// present. beginSyncCalibration is never called while Browse is up or before
+// the gate passes.
+- (void)presentSyncCalibrationFromUI
+{
+    [self presentSyncCalibrationFromUIAttempt:0];
+}
+
+- (void)presentSyncCalibrationFromUIAttempt:(NSInteger)attempt
+{
+    if (self.syncCalibrationController != nil || self.projectMBridge == nil || !self.projectMBridge.isReady)
+    {
+        return;
+    }
+    if (self.quickSettingsController != nil || self.presetOptionsController != nil)
+    {
+        return;
+    }
+
+    if (self.browseController != nil)
+    {
+        // dismissBrowse also unpauses the display link; re-enter once the
+        // dismissal settles so the modal presentation slot is free.
+        [self dismissBrowse];
+    }
+
+    // Correctness invariant: calibration is meaningless with a paused render
+    // loop (feedLivePCM never runs). Browse dismissal restores it, but assert
+    // the state explicitly rather than assuming the path.
+    self.displayLink.paused = NO;
+
+    if (![self.projectMBridge isLivePCMActive])
+    {
+        [self postRemoteStatusWithEyebrow:@"Sync Calibration"
+                                    title:@"Connect Snapcast and play music to calibrate"
+                                   symbol:@"waveform.slash"
+                                   sticky:NO];
+        RoonVisLog(@"Sync calibration: entry blocked (no live PCM)");
+        return;
+    }
+
+    UIViewController *presentingController = self.window.rootViewController;
+    if (presentingController == nil || presentingController.presentedViewController != nil)
+    {
+        // A modal dismissal (Browse) is still animating: retry briefly rather
+        // than silently giving up. Bounded so a stuck presentation can't loop.
+        if (attempt < 8)
+        {
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.25 * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{
+                [self presentSyncCalibrationFromUIAttempt:attempt + 1];
+            });
+        }
+        else
+        {
+            RoonVisLog(@"Sync calibration: entry abandoned (presentation slot never freed)");
+        }
+        return;
+    }
+
+    [self.projectMBridge beginSyncCalibration];
+    UIViewController *calibration = [SyncCalibrationFactory makeWithGlView:self];
+    self.syncCalibrationController = calibration;
+    RoonVisLog(@"Sync calibration present");
+    [presentingController presentViewController:calibration animated:![RoonVisTheme reduceMotionEnabled] completion:nil];
+    [self setNeedsFocusUpdate];
+    [self updateFocusIfNeeded];
+}
+
+- (void)dismissSyncCalibrationSaving:(BOOL)save
+{
+    UIViewController *calibration = self.syncCalibrationController;
+    if (calibration == nil)
+    {
+        return;
+    }
+
+    NSInteger alignedMs = self.projectMBridge.syncCalibrationDelayMs;
+    double avgRenderMs = 0.0;
+    double avgSwapMs = 0.0;
+    [self readLatencyLockRunningAveragesRenderMs:&avgRenderMs swapMs:&avgSwapMs];
+    [self.projectMBridge endSyncCalibrationSaving:save avgRenderMs:avgRenderMs avgSwapMs:avgSwapMs];
+    [self resetLatencyLockWindow];
+
+    self.syncCalibrationController = nil;
+    [calibration dismissViewControllerAnimated:![RoonVisTheme reduceMotionEnabled] completion:nil];
+    [self setNeedsFocusUpdate];
+    [self updateFocusIfNeeded];
+
+    if (save)
+    {
+        // The saved setting IS the aligned number (render compensation is
+        // internal), so one number tells the whole user-facing story.
+        [self postRemoteStatusWithEyebrow:@"Sync Calibration"
+                                    title:[NSString stringWithFormat:@"Sync saved · %ld ms",
+                                                                     static_cast<long>(alignedMs)]
+                                   symbol:@"metronome"
+                                   sticky:NO];
+    }
+    else
+    {
+        [self postRemoteStatusWithEyebrow:@"Sync Calibration"
+                                    title:@"Cancelled — previous sync restored"
+                                   symbol:@"arrow.uturn.backward"
+                                   sticky:NO];
+    }
+    RoonVisLog(@"Sync calibration dismissed (save=%d)", save ? 1 : 0);
+}
+
 - (void)setPresetRotationHeldFromUI:(BOOL)held
 {
     RoonVisLog(@"Quick settings action: rotation %@", held ? @"paused" : @"resumed");

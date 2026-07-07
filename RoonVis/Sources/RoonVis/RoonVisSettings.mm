@@ -3,6 +3,9 @@
 #import "RoonVisCrashReporter.h"
 
 #include "DeviceTier.h"
+#include "SnapPCM.h"
+
+#include <string>
 
 #include <algorithm>
 #include <cmath>
@@ -23,6 +26,7 @@ NSString *const RoonVisSettingsFavoritePresetFilenamesKey = @"favoritePresetFile
 NSString *const RoonVisSettingsHiddenPresetFilenamesKey = @"hiddenPresetFilenames";
 NSString *const RoonVisSettingsFrameRateCapKey = @"frameRateCap";
 NSString *const RoonVisSettingsDrawableSizePresetKey = @"drawableSizePreset";
+NSString *const RoonVisSettingsSnapcastServerHostKey = @"snapcastServerHost";
 
 namespace
 {
@@ -82,6 +86,24 @@ static constexpr NSInteger kAudioInputDelayStepMs = 5;
 static constexpr NSInteger kWarpMeshWidthMinimum = 48;
 static constexpr NSInteger kWarpMeshWidthMaximum = 128;
 static constexpr NSInteger kWarpMeshWidthStep = 16;
+
+// The build-time default host from Info.plist; the setting starts here and a
+// cleared/invalid entry reverts to it.
+static NSString *InfoPlistSnapcastHost(void)
+{
+    NSString *host = NSBundle.mainBundle.infoDictionary[@"SnapcastServerHost"];
+    return [host isKindOfClass:NSString.class] && host.length > 0 ? host : @"192.0.2.10";
+}
+
+static NSString *NormalizedHostOrEmpty(NSString *value)
+{
+    if (![value isKindOfClass:NSString.class])
+    {
+        return @"";
+    }
+    std::string normalized = RoonVis::NormalizeSnapcastHost(std::string(value.UTF8String ?: ""));
+    return normalized.empty() ? @"" : [NSString stringWithUTF8String:normalized.c_str()];
+}
 
 static NSInteger ClampIntegerToStep(NSInteger value, NSInteger minimum, NSInteger maximum, NSInteger step)
 {
@@ -180,6 +202,7 @@ static NSSet<NSString *> *FilenameSetFromDefaultsValue(id value)
             // Resolved once here at startup; both getters also clamp per tier.
             RoonVisSettingsFrameRateCapKey: @(RoonVisDefaultFrameRateForCurrentTier()),
             RoonVisSettingsDrawableSizePresetKey: DrawableSizePresetPersistedValue(RoonVisDefaultDrawablePresetForCurrentTier()),
+            RoonVisSettingsSnapcastServerHostKey: InfoPlistSnapcastHost(),
         };
         [[NSUserDefaults standardUserDefaults] registerDefaults:defaults];
     });
@@ -478,6 +501,28 @@ static NSSet<NSString *> *FilenameSetFromDefaultsValue(id value)
                         forKey:RoonVisSettingsDrawableSizePresetKey];
     RoonVisLog(@"Settings changed: drawableSizePreset=%@", RoonVisDrawableSizePresetLabel(clamped));
     [self postChangeNotificationForKey:RoonVisSettingsDrawableSizePresetKey];
+}
+
+- (NSString *)snapcastServerHost
+{
+    NSString *stored = NormalizedHostOrEmpty([[self defaults] stringForKey:RoonVisSettingsSnapcastServerHostKey]);
+    return stored.length > 0 ? stored : InfoPlistSnapcastHost();
+}
+
+- (void)setSnapcastServerHost:(NSString *)snapcastServerHost
+{
+    NSString *normalized = NormalizedHostOrEmpty(snapcastServerHost);
+    if (normalized.length == 0)
+    {
+        normalized = InfoPlistSnapcastHost();
+    }
+    if ([self.snapcastServerHost isEqualToString:normalized])
+    {
+        return;
+    }
+    [[self defaults] setObject:normalized forKey:RoonVisSettingsSnapcastServerHostKey];
+    RoonVisLog(@"Settings changed: snapcastServerHost=%@", normalized);
+    [self postChangeNotificationForKey:RoonVisSettingsSnapcastServerHostKey];
 }
 
 - (NSSet<NSString *> *)favoritePresetFilenames

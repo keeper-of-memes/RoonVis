@@ -60,6 +60,8 @@ FOUNDATION_EXPORT NSInteger RoonVisEffectiveFrameRate(UIView *view);
     CFTimeInterval _presetWarmCurrentFrameInterval;
     RoonVis::PresetWarmCache _presetWarmCache;
     RoonVis::PresetIdleWarmBudget _presetIdleWarmBudget;
+    NSString *_appliedSnapcastHost; //!< Host the running SnapcastClient was created with (MRC: copied).
+    uint16_t _appliedSnapcastPort;  //!< Port from Info.plist (not user-settable).
     // Select/PlayPause went down and has not yet been consumed by the long-press
     // recognizer: the hold-toggle fires on press RELEASE (pressesEnded) so a long
     // press can open the preset-options overlay instead.
@@ -78,6 +80,7 @@ FOUNDATION_EXPORT NSInteger RoonVisEffectiveFrameRate(UIView *view);
 @property(nonatomic, retain, nullable) UIViewController *browseController;
 @property(nonatomic, retain, nullable) UIViewController *quickSettingsController;
 @property(nonatomic, retain, nullable) UIViewController *presetOptionsController;
+@property(nonatomic, retain, nullable) UIViewController *syncCalibrationController;
 
 - (BOOL)setupEGL;
 - (BOOL)recreateSurfaceIfNeededForDrawableSize:(CGSize)drawableSize;
@@ -127,6 +130,11 @@ FOUNDATION_EXPORT NSInteger RoonVisEffectiveFrameRate(UIView *view);
 - (void)dismissPresetOptions;
 - (void)dismissBrowse;
 - (void)showVisualizerHintIfNeeded;
+
+// Latency-lock running averages + window reset (defined in the Diagnostics
+// category; used by the sync-calibration dismiss path in Controls).
+- (void)readLatencyLockRunningAveragesRenderMs:(double *)renderMs swapMs:(double *)swapMs;
+- (void)resetLatencyLockWindow;
 
 @end
 

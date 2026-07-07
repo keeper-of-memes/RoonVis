@@ -25,6 +25,9 @@ NS_ASSUME_NONNULL_BEGIN
 - (void)toggleFavoriteAtIndexFromUI:(NSUInteger)index NS_SWIFT_NAME(toggleFavoriteFromUI(at:));
 - (void)hidePresetAtIndexFromUI:(NSUInteger)index NS_SWIFT_NAME(hidePresetFromUI(at:));
 - (void)dismissBrowseFromUI;
+// Sync calibration: entry (dismisses Browse first, gates on live PCM) and exit.
+- (void)presentSyncCalibrationFromUI;
+- (void)dismissSyncCalibrationSaving:(BOOL)save;
 
 @end
 

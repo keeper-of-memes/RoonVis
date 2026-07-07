@@ -246,9 +246,21 @@ struct RVSegmentRow: View {
             .padding(4)
             .background(RVTheme.Colors.material, in: Capsule())
         }
-        .onChange(of: focusedSegment) {
-            if let focusedSegment {
-                selection = focusedSegment
+        .onChange(of: focusedSegment) { oldValue, newValue in
+            guard let newValue else { return }
+            // Focus ENTERING the row must never commit: tvOS lands on whichever
+            // pill is geometrically nearest to the previous focus, so traversal
+            // through the row silently rewrote settings (rotation mode flipping
+            // to Loop, render size to 720p, ...). Snap entry focus to the
+            // selected pill instead; only movement WITHIN the row commits.
+            if oldValue == nil {
+                if newValue != selection {
+                    focusedSegment = selection
+                }
+                return
+            }
+            if newValue != selection {
+                selection = newValue
             }
         }
         .onChange(of: selection) {

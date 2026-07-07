@@ -315,3 +315,31 @@ void LivePCMDelayBuffer::RebaseToDelay(size_t delayFrames)
 }
 
 }  // namespace RoonVis
+
+namespace RoonVis
+{
+std::string NormalizeSnapcastHost(const std::string &input)
+{
+    size_t begin = 0;
+    size_t end = input.size();
+    while (begin < end && (input[begin] == ' ' || input[begin] == '\t' || input[begin] == '\n' || input[begin] == '\r'))
+    {
+        begin++;
+    }
+    while (end > begin && (input[end - 1] == ' ' || input[end - 1] == '\t' || input[end - 1] == '\n' || input[end - 1] == '\r'))
+    {
+        end--;
+    }
+    std::string trimmed = input.substr(begin, end - begin);
+    for (const char c : trimmed)
+    {
+        const unsigned char uc = static_cast<unsigned char>(c);
+        if (uc <= 0x20 || uc == 0x7f)
+        {
+            return std::string();
+        }
+    }
+    return trimmed;
+}
+
+} // namespace RoonVis

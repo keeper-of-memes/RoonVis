@@ -1,6 +1,8 @@
 #import "ProjectMBridgeInternal.h"
 
+#import "ProjectMPresetSupport.h"
 #import "RoonVisCrashReporter.h"
+#import "RoonVisDeviceTier.h"
 #import "RoonVisPerfCounters.h"
 
 #include <map>
@@ -38,6 +40,7 @@ static constexpr CFTimeInterval kPresetDirectPreloadMinLeadSeconds = 5.0;
 // escape hatch that wipes the learned list.
 static NSString *const kLearnedSlowPresetsKey = @"RoonVisLearnedSlowPresets";
 static NSString *const kLearnedSlowPendingCountsKey = @"RoonVisSlowPresetPendingCounts";
+static NSString *const kLearnedSlowHDSeedAppliedKey = @"RoonVisLearnedSlowHDSeedApplied";
 static NSString *const kClearLearnedSlowPresetsKey = @"RoonVisClearLearnedSlowPresets";
 }  // namespace
 
@@ -55,6 +58,7 @@ static NSString *const kClearLearnedSlowPresetsKey = @"RoonVisClearLearnedSlowPr
     {
         [defaults removeObjectForKey:kLearnedSlowPresetsKey];
         [defaults removeObjectForKey:kLearnedSlowPendingCountsKey];
+        [defaults removeObjectForKey:kLearnedSlowHDSeedAppliedKey];
         [defaults setBool:NO forKey:kClearLearnedSlowPresetsKey];
         [defaults synchronize];
         _learnedSlowStore.Clear();
@@ -97,6 +101,25 @@ static NSString *const kClearLearnedSlowPresetsKey = @"RoonVisClearLearnedSlowPr
         }
     }
     _learnedSlowStore.LoadPendingCounts(pending);
+
+    // One-time tier seed: on the Apple TV HD, pre-populate the learned-slow store with
+    // the presets that failed the full-pack A8 burn-in, sparing new installs the
+    // first-lap discovery stutters. Union into any existing learned state; the clear
+    // escape hatch above resets the flag so a factory reset re-seeds.
+    if (RoonVisCurrentDeviceTier() == RoonVisDeviceTierHD &&
+        ![defaults boolForKey:kLearnedSlowHDSeedAppliedKey])
+    {
+        const RoonVis::PresetBlocklists &blocklists = RoonVisBundlePresetBlocklists();
+        if (!blocklists.learnedSlowSeedHD.empty())
+        {
+            std::vector<std::string> seed(blocklists.learnedSlowSeedHD.begin(),
+                                          blocklists.learnedSlowSeedHD.end());
+            _learnedSlowStore.LoadConfirmed(seed);
+            [self persistLearnedSlowState];
+            RoonVisLog(@"ProjectM hardening: applied HD learned-slow seed (%zu presets)", seed.size());
+        }
+        [defaults setBool:YES forKey:kLearnedSlowHDSeedAppliedKey];
+    }
 
     // Seed the session-only rotation-exclusion set so learned-slow presets are skipped
     // from the very first rotation this launch.

@@ -4,6 +4,7 @@
 #import "PresetRotationScheduler.h"
 #import "PresetShelfModel.h"
 #import "PresetWarmCache.h"
+#include "AudioOnsetDetector.h"
 #import "PreprocessCache.h"
 #import "RoonVisSettings.h"
 #import "SnapPCM.h"
@@ -95,6 +96,19 @@ NS_ASSUME_NONNULL_BEGIN
     CFTimeInterval _lastLivePCMRenderTime;
     NSInteger _pendingAudioInputDelayMs;
     BOOL _hasPendingAudioDelay;
+    // Sync-calibration state (GL/main thread only). The dual stash restores
+    // BOTH the target and the lock-trimmed effective value on cancel.
+    BOOL _syncCalibrationActive;
+    BOOL _syncCalibrationOnsetThisFrame;
+    NSInteger _syncCalStashedTargetMs;
+    NSInteger _syncCalStashedEffectiveMs;
+    // Internal render compensation: the latency lock budgets against
+    // (audioInputDelayMs + this), so the user-visible setting stays the number
+    // they ALIGNED during calibration while the lock still holds total latency
+    // constant. Persisted (RoonVisSyncRenderCompensationMs); GL thread only.
+    NSInteger _syncRenderCompensationMs;
+    BOOL _syncCalStashedRotationHeld;
+    RoonVis::AudioOnsetDetector _onsetDetector;
     // Preprocessed-HLSL cache + the C hooks bridged to it. Both outlive the projectM
     // instance (owned here on the bridge). All access is on the GL/render thread, where
     // transpile runs, so no locking is needed. Registered via projectm_set_preprocess_cache.

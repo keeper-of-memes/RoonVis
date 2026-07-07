@@ -6,6 +6,7 @@
 #import "RoonVisEGLContext.h"
 #import "RoonVisPerfCounters.h"
 #import "RoonVisSettings.h"
+#import "RoonVis-Swift.h"
 #import "SnapcastClient.h"
 
 #import <QuartzCore/CAMetalLayer.h>
@@ -268,14 +269,15 @@ static BOOL RoonVisDisableSlowPresetSkip()
         }
         [self applyPresetWarmCacheSettings];
 
+        // Host comes from the user setting (which defaults to the Info.plist
+        // SnapcastServerHost value; RoonVisSettings owns the fallback). The
+        // port stays plist-only.
         NSDictionary *info = NSBundle.mainBundle.infoDictionary;
-        NSString *snapcastHost = info[@"SnapcastServerHost"];
-        if (snapcastHost.length == 0)
-        {
-            snapcastHost = @"192.0.2.10";
-        }
+        NSString *snapcastHost = [RoonVisSettings sharedSettings].snapcastServerHost;
         NSNumber *snapcastPortNumber = info[@"SnapcastServerPort"];
         uint16_t snapcastPort = snapcastPortNumber != nil ? static_cast<uint16_t>(snapcastPortNumber.unsignedShortValue) : 1704;
+        _appliedSnapcastHost = [snapcastHost copy];
+        _appliedSnapcastPort = snapcastPort;
         self.snapcastClient = [[[SnapcastClient alloc] initWithHost:snapcastHost port:snapcastPort bridge:self.projectMBridge] autorelease];
         [self.snapcastClient start];
         [[NSNotificationCenter defaultCenter] addObserver:self
@@ -306,6 +308,10 @@ static BOOL RoonVisDisableSlowPresetSkip()
     // controls are reachable and its Menu->dismiss handler receives the press.
     // Without this, focus stayed on the visualizer and Menu opened Browse instead
     // of dismissing quick settings (the overlay couldn't be dismissed).
+    if (self.syncCalibrationController != nil)
+    {
+        return @[ self.syncCalibrationController.view ];
+    }
     if (self.quickSettingsController != nil)
     {
         return @[ self.quickSettingsController.view ];
@@ -358,6 +364,24 @@ static BOOL RoonVisDisableSlowPresetSkip()
     }
     [self.projectMBridge resizeToDrawableSize:targetDrawableSize];
     [self drawFrame];
+}
+
+// Restarts the Snapcast client when the user changes the server host. A no-op
+// when the applied host is unchanged, so unrelated settings changes never
+// bounce the connection.
+- (void)applySnapcastHostSetting
+{
+    NSString *host = [RoonVisSettings sharedSettings].snapcastServerHost;
+    if (self.snapcastClient == nil || [host isEqualToString:_appliedSnapcastHost])
+    {
+        return;
+    }
+    RoonVisLog(@"Snapcast host changed: %@ -> %@ (restarting client)", _appliedSnapcastHost, host);
+    [self.snapcastClient stop];
+    [_appliedSnapcastHost release];
+    _appliedSnapcastHost = [host copy];
+    self.snapcastClient = [[[SnapcastClient alloc] initWithHost:host port:_appliedSnapcastPort bridge:self.projectMBridge] autorelease];
+    [self.snapcastClient start];
 }
 
 - (void)screenModeDidChange:(NSNotification *)notification
@@ -536,6 +560,7 @@ static BOOL RoonVisDisableSlowPresetSkip()
     // recreate when the size is unchanged).
     [self applyDisplayTimingToDisplayLink];
     [self applyDrawableConfiguration];
+    [self applySnapcastHostSetting];
     if ([RoonVisSettings sharedSettings].diagnosticsOverlayEnabled)
     {
         [self resetPerformanceDiagnostics];
@@ -633,6 +658,8 @@ static BOOL RoonVisDisableSlowPresetSkip()
 
 - (void)dealloc
 {
+    [_appliedSnapcastHost release];
+    _appliedSnapcastHost = nil;
     [[NSNotificationCenter defaultCenter] removeObserver:self];
     [_snapcastClient stop];
     [_displayLink invalidate];
@@ -968,6 +995,13 @@ static BOOL RoonVisDisableSlowPresetSkip()
         NSLog(@"ANGLE Step A GL error after renderFrame: 0x%04x", error);
     }
 #endif
+
+    // Sync calibration: fire the onset pulse BEFORE the swap so the flash and
+    // the GL frame land in the same compositor commit (review amendment #6).
+    if (self.syncCalibrationController != nil && self.projectMBridge.syncCalibrationOnsetThisFrame)
+    {
+        [(SyncCalibrationViewController *)self.syncCalibrationController pulseOnset];
+    }
 
     CFTimeInterval swapStart = CACurrentMediaTime();
     EGLBoolean swapped = eglSwapBuffers(self.eglDisplay, self.eglSurface);

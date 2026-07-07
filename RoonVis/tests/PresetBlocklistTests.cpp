@@ -26,6 +26,7 @@ void TestParseBundleJSON()
         "\"slow\":[\"a.milk\",\"a.milk\"],"
         "\"crashing\":[\"b.milk\"],"
         "\"staticHeavy\":[\"c.milk\"],"
+        "\"learnedSlowSeedHD\":[\"d.milk\",\"e.milk\"],"
         "\"notes\":[\"ignored\"]"
         "}";
     PresetBlocklists parsed;
@@ -35,6 +36,9 @@ void TestParseBundleJSON()
     CHECK(IsCrashingPreset(parsed, "b.milk"));
     CHECK(IsStaticHeavyPreset(parsed, "c.milk"));
     CHECK(!IsStaticHeavyPreset(parsed, "ignored"));
+    CHECK(parsed.learnedSlowSeedHD.size() == 2);
+    CHECK(parsed.learnedSlowSeedHD.count("d.milk") == 1);
+    CHECK(parsed.learnedSlowSeedHD.count("e.milk") == 1);
 }
 
 void TestParseRejectsMissingRequiredLists()

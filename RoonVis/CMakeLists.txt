@@ -26,8 +26,13 @@ if(ROONVIS_BUILD_TESTS)
     Sources/RoonVis/DeviceTier.cpp
     Sources/RoonVis/PresetRotationCursor.h
     Sources/RoonVis/PresetRotationCursor.cpp
+    Sources/RoonVis/AudioOnsetDetector.h
+    Sources/RoonVis/AudioOnsetDetector.cpp
+    Sources/RoonVis/SyncCalibrationMath.h
+    Sources/RoonVis/SyncCalibrationMath.cpp
     tests/DeviceTierTests.cpp
     tests/PresetRotationCursorTests.cpp
+    tests/AudioOnsetDetectorTests.cpp
     tests/PresetShelfModelTests.cpp
     tests/SnapPCMTests.cpp
     tests/LivePCMDelayBufferTests.cpp
@@ -318,6 +323,7 @@ add_executable(RoonVis MACOSX_BUNDLE
   Sources/RoonVis/QuickSettingsPanel.swift
   Sources/RoonVis/RootChrome.swift
   Sources/RoonVis/SettingsScreen.swift
+  Sources/RoonVis/SyncCalibration.swift
   Sources/RoonVis/SettingsStore.swift
   Sources/RoonVis/Theme.swift
   Sources/RoonVis/RoonVis-Bridging-Header.h
@@ -348,6 +354,10 @@ add_executable(RoonVis MACOSX_BUNDLE
   Sources/RoonVis/DeviceTier.cpp
   Sources/RoonVis/PresetRotationCursor.h
   Sources/RoonVis/PresetRotationCursor.cpp
+  Sources/RoonVis/AudioOnsetDetector.h
+  Sources/RoonVis/AudioOnsetDetector.cpp
+  Sources/RoonVis/SyncCalibrationMath.h
+  Sources/RoonVis/SyncCalibrationMath.cpp
   Sources/RoonVis/RoonVisDeviceTier.h
   Sources/RoonVis/RoonVisDeviceTier.mm
   Sources/RoonVis/RoonVisCrashReporter.h

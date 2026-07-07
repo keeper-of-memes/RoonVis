@@ -215,6 +215,15 @@ static NSInteger RoonVisDisplayRefreshRate(UIView *view)
         return;
     }
 
+    // Sync calibration: keep ACCUMULATING (the save path reads the running
+    // averages) but never apply trims - the effective delay is pinned to the
+    // user's draft for the whole session. The window also does not reset, so
+    // a save N seconds in sees exactly the frames since it last reset.
+    if (self.projectMBridge.syncCalibrationActive)
+    {
+        return;
+    }
+
     double avgRenderMs = (_latencyLockTotalRenderDuration / _latencyLockFrames) * 1000.0;
     double avgSwapMs = (_latencyLockTotalSwapDuration / _latencyLockFrames) * 1000.0;
     // Trim the buffer by render/swap's excess over a nominal baseline so total holds at
@@ -224,7 +233,7 @@ static NSInteger RoonVisDisplayRefreshRate(UIView *view)
     // never shrink below a jitter-cushion floor.
     static const double kNominalRenderMs = 5.0;
     static const double kMinAdaptiveBufferMs = 100.0;
-    NSInteger targetBufferMs = self.projectMBridge.audioInputDelayMs;
+    NSInteger targetBufferMs = self.projectMBridge.audioInputDelayMs + self.projectMBridge.syncRenderCompensationMs;
     double desiredBufferMs = static_cast<double>(targetBufferMs) + kNominalRenderMs - avgRenderMs - avgSwapMs;
     NSInteger effectiveBufferMs = static_cast<NSInteger>(llround(
         MAX(kMinAdaptiveBufferMs, MIN(static_cast<double>(targetBufferMs), desiredBufferMs))));
@@ -241,6 +250,23 @@ static NSInteger RoonVisDisplayRefreshRate(UIView *view)
                    static_cast<long>(before), static_cast<long>(after), avgRenderMs, avgSwapMs, static_cast<long>(targetBufferMs));
     }
 
+    _latencyLockWindowStartTime = 0;
+    _latencyLockTotalRenderDuration = 0;
+    _latencyLockTotalSwapDuration = 0;
+    _latencyLockFrames = 0;
+}
+
+// Running (partial-window) latency-lock averages for the sync-calibration save
+// path, plus a reset so the first post-save trim starts a clean window.
+- (void)readLatencyLockRunningAveragesRenderMs:(double *)renderMs swapMs:(double *)swapMs
+{
+    const double frames = _latencyLockFrames > 0 ? static_cast<double>(_latencyLockFrames) : 0.0;
+    *renderMs = frames > 0 ? (_latencyLockTotalRenderDuration / frames) * 1000.0 : 0.0;
+    *swapMs = frames > 0 ? (_latencyLockTotalSwapDuration / frames) * 1000.0 : 0.0;
+}
+
+- (void)resetLatencyLockWindow
+{
     _latencyLockWindowStartTime = 0;
     _latencyLockTotalRenderDuration = 0;
     _latencyLockTotalSwapDuration = 0;
