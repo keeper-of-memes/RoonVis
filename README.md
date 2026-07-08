@@ -61,11 +61,12 @@ Before building, set these for your environment:
 | What | Where | Set to |
 |---|---|---|
 | Apple Developer Team ID | CMake `-DROONVIS_DEVELOPMENT_TEAM=...` | your Team ID (free Personal Team is fine) |
-| Snapcast server host | `Info.plist` → `SnapcastServerHost` | your Pi's IP |
+| Snapcast server host | **In-app: Settings → Connection** (v0.1.2) | your Pi's IP or hostname |
 
-**Recommended in-app settings** (also the shipped defaults): audio-sync **delay 270 ms**
-(+ **270 ms** on the Roon audio output), render **1080p @ 60** (Apple TV HD: **720p @ 30**),
-warp **mesh 96×72** (HD: **64×48**). Frame rate and render quality are adjustable live in
+**Recommended in-app settings**: run **Settings → Audio → Calibrate sync** for the A/V
+delay (v0.1.2 — sets it by ear in twenty seconds, including your TV's panel lag; keep
+**270 ms** on the Roon audio output as the anchor). Rendering defaults: **1080p @ 60**
+(Apple TV HD: **720p @ 30**), warp **mesh 96×72** (HD: **64×48**) — adjustable live in
 **Settings → Rendering**.
 → [Recommended Settings](../../wiki/Recommended-Settings) ·
 [Delay Structure](../../wiki/Delay-Structure) · [Supported Resolutions](../../wiki/Supported-Resolutions)
