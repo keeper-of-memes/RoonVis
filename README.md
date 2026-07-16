@@ -33,6 +33,13 @@ visuals to your TV.
 [Apple TV Optimizations & Patch Catalog](../../wiki/Apple-TV-Optimizations-and-Patch-Catalog) ·
 [Architecture](../../wiki/Architecture).**
 
+> 🆕 **v0.2.0** — the **full Cream of the Crop pack (7,700+ presets, 26× more)** with
+> **category browsing** (sections, sub-category rows, chip filter) and a new **Category
+> rotation mode** that keeps automatic preset changes within the playing preset's visual
+> family; **dramatically snappier menus**; a black-screen recovery fix; and a major
+> internals rework (tested rotation engine, event-driven preload planning, 825-check
+> test suite, CI).
+
 ---
 
 ## Getting started (quick)

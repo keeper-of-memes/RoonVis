@@ -1,7 +1,8 @@
 # Bundled Milkdrop presets
 
-A curated subset (~325, stride-sampled for author/style diversity) of the
-projectM **Cream of the Crop** pack:
+The full projectM **Cream of the Crop** pack (7,700+ presets, preserving the
+pack's category/sub-category folder tree; a small number of presets that fail
+on tvOS are excluded via the bundled blocklists):
 https://github.com/projectM-visualizer/presets-cream-of-the-crop
 
 Companion textures (in `../textures/`) are from the projectM

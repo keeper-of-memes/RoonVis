@@ -59,7 +59,7 @@ int DefaultFrameRateForTier(DeviceTier tier)
 int DefaultWarpMeshWidthForTier(DeviceTier tier)
 {
     // The warp mesh is evaluated per-vertex on the CPU every frame; 96 is
-    // tuned for the A15. Apple TV HD burn-in data (2026-07-06): at 96 the A8 renders
+    // tuned for the A15. Office (2) data (2026-07-06): at 96 the A8 renders
     // easy presets in ~18-25 ms at 720p but heavy windows average ~53 ms, so
     // the HD default steps down to 64 (users can raise it).
     return tier == DeviceTier::HD ? 64 : 96;

@@ -18,11 +18,16 @@ struct PresetShelfInput
     std::string filename;
     std::string title;
     bool favorite = false;
+    // CotC tree metadata (empty for packs without categories -> author clustering).
+    std::string category;
+    std::string subcategory;
 };
 
 struct PresetShelf
 {
     std::string title;
+    // Top-category for section headers; empty when author clustering built the shelf.
+    std::string category;
     std::vector<size_t> indexes;
 };
 
@@ -156,6 +161,34 @@ inline std::vector<PresetShelf> BuildPresetShelves(const std::vector<PresetShelf
             shelf.indexes.push_back(preset->index);
         }
         shelves.push_back(std::move(shelf));
+        return shelves;
+    }
+
+    // CotC tree path: when category metadata is present, one shelf per
+    // (category, subcategory) directory, ordered by top category then sub.
+    // NO runtime tiny-sub merge - the pack build owns <Top>/Other folding.
+    const bool hasCategories =
+        std::any_of(visible.begin(), visible.end(),
+                    [](const PresetShelfInput *preset) { return !preset->category.empty(); });
+    if (hasCategories)
+    {
+        std::map<std::pair<std::string, std::string>, PresetShelf> grouped;
+        for (const PresetShelfInput *preset : visible)
+        {
+            const std::string category = preset->category.empty() ? "Other" : preset->category;
+            const std::string sub = preset->subcategory.empty() ? "Other" : preset->subcategory;
+            PresetShelf &shelf = grouped[{category, sub}];
+            if (shelf.title.empty())
+            {
+                shelf.title = sub;
+                shelf.category = category;
+            }
+            shelf.indexes.push_back(preset->index);
+        }
+        for (auto &entry : grouped)
+        {
+            shelves.push_back(std::move(entry.second));
+        }
         return shelves;
     }
 

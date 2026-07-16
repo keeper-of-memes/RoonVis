@@ -22,21 +22,27 @@ std::string TrimWhitespace(const std::string &value)
 
 std::vector<std::string> ParseFixedRotationList(const std::string &value)
 {
+    // Delimiter: '|' when the value contains one, else ','. Milkdrop preset
+    // filenames frequently contain commas (which silently fragmented
+    // comma-joined lists); no filename in the pack contains a pipe, so
+    // pipe-joined lists pass arbitrary names losslessly. Comma stays the
+    // default for backwards compatibility with existing runbooks.
+    const char delimiter = value.find('|') != std::string::npos ? '|' : ',';
     std::vector<std::string> filenames;
     size_t start = 0;
     while (start <= value.size())
     {
-        size_t comma = value.find(',', start);
-        if (comma == std::string::npos)
+        size_t split = value.find(delimiter, start);
+        if (split == std::string::npos)
         {
-            comma = value.size();
+            split = value.size();
         }
-        std::string entry = TrimWhitespace(value.substr(start, comma - start));
+        std::string entry = TrimWhitespace(value.substr(start, split - start));
         if (!entry.empty())
         {
             filenames.push_back(std::move(entry));
         }
-        start = comma + 1;
+        start = split + 1;
     }
     return filenames;
 }

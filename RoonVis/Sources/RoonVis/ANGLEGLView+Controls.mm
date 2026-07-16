@@ -1,5 +1,6 @@
 #import "ANGLEGLViewInternal.h"
 
+#import "PresetThumbnailRenderer.h"
 #import "ProjectMBridge.h"
 #import "RoonVis-Swift.h"
 #import "RoonVisCrashReporter.h"
@@ -271,6 +272,9 @@ static NSString * const kVisualizerHintSeenDefaultsKey = @"RoonVisVisualizerCont
 
     RoonVisLog(@"Browse dismiss");
     self.browseController = nil;
+    // Drop the thumbnail live-render backlog so queued jobs don't drain against the live
+    // visualizer after the grid is gone (B7). Cache/bundled hits are unaffected.
+    [[PresetThumbnailRenderer sharedRenderer] cancelPendingThumbnails];
     self.displayLink.paused = NO;
     [browse dismissViewControllerAnimated:![RoonVisTheme reduceMotionEnabled] completion:nil];
 }

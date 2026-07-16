@@ -88,6 +88,13 @@ void TestParseFixedRotationList()
     CHECK(ParseFixedRotationList(" , ,\t").empty());
     // Single entry, no comma.
     CHECK(ParseFixedRotationList("solo.milk") == std::vector<std::string>{"solo.milk"});
+    // Pipe delimiter when present: comma-containing filenames pass losslessly
+    // (Milkdrop names frequently contain commas; no pack filename contains '|').
+    std::vector<std::string> commaNames{"271 nz, m1, i love life.milk", "b.milk"};
+    CHECK(ParseFixedRotationList("271 nz, m1, i love life.milk|b.milk") == commaNames);
+    CHECK(ParseFixedRotationList(" a.milk | b.milk || c.milk |") == expected);
+    // Comma stays the default when no pipe is present (backwards compatibility).
+    CHECK(ParseFixedRotationList("a.milk,b.milk,c.milk") == expected);
 }
 
 void TestResolveFixedRotationIndexes()

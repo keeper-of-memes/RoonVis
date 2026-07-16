@@ -2,6 +2,7 @@
 
 #import "RoonVisPerfCounters.h"
 #import "RoonVisCrashReporter.h"
+#import "RoonVisPerfDiagnosticsSink.h"
 
 static NSString *const kLastShownPresetFilenameKey = @"RoonVisLastShownPresetFilename";
 
@@ -19,6 +20,15 @@ static NSString *const kLastShownPresetFilenameKey = @"RoonVisLastShownPresetFil
 - (NSUInteger)presetCount
 {
     return static_cast<NSUInteger>(_presetPaths.size());
+}
+
+- (NSString *)presetCategoryAtIndex:(NSUInteger)index
+{
+    if (index >= _presetCategories.size() || _presetCategories[index].empty())
+    {
+        return nil;
+    }
+    return [NSString stringWithUTF8String:_presetCategories[index].c_str()];
 }
 
 - (NSString *)presetFilenameAtIndex:(NSUInteger)index
@@ -97,7 +107,10 @@ static NSString *const kLastShownPresetFilenameKey = @"RoonVisLastShownPresetFil
             [presetIndexes addObject:[NSNumber numberWithUnsignedLong:static_cast<unsigned long>(presetIndex)]];
         }
         NSString *title = [NSString stringWithUTF8String:shelf.title.c_str()] ?: @"Other";
-        RoonVisPresetShelf *value = [[RoonVisPresetShelf alloc] initWithTitle:title presetIndexes:presetIndexes];
+        NSString *category = shelf.category.empty()
+            ? nil
+            : ([NSString stringWithUTF8String:shelf.category.c_str()] ?: nil);
+        RoonVisPresetShelf *value = [[RoonVisPresetShelf alloc] initWithTitle:title category:category presetIndexes:presetIndexes];
         [result addObject:value];
         [value release];
     }
@@ -173,6 +186,7 @@ static NSString *const kLastShownPresetFilenameKey = @"RoonVisLastShownPresetFil
     }
 
     _currentPresetIndex = _presetPaths.size() - 1;
+    [self updateRotationEngineAnchor]; // R2: anchor tracks the launch fallback walk start
     return [self advancePresetByOffset:1 smooth:NO];
 }
 
@@ -215,6 +229,7 @@ static NSString *const kLastShownPresetFilenameKey = @"RoonVisLastShownPresetFil
         _presetStepDirection = 1;
     }
     _currentPresetIndex = static_cast<size_t>(index);
+    [self updateRotationEngineAnchor]; // R2: anchor tracks the in-flight request
     self.requestedPresetName = presetName;
     _lastPresetLoadFailed = NO;
     [self invalidatePreloadedPresetTracking];
@@ -229,10 +244,10 @@ static NSString *const kLastShownPresetFilenameKey = @"RoonVisLastShownPresetFil
     if (!_lastPresetLoadFailed && [self.requestedPresetName isEqualToString:presetName])
     {
         _confirmedPresetIndex = _currentPresetIndex;
+        [self updateRotationEngineAnchor]; // R2: anchor tracks the confirm
         self.confirmedPresetName = presetName;
-        _lastPresetSwitchTime = CACurrentMediaTime();
-        _preloadAttemptPresetIndex = SIZE_MAX;
-        _preloadAttemptPresetPath.clear();
+        // A5: funnel — sets _lastPresetSwitchTime and recomputes the dwell plans.
+        [self noteSwitchConfirmedAtTime:CACurrentMediaTime()];
         RoonVisLog(@"Preset switch confirmed: %@", presetName);
         [self notifyEngineStateDidChange];
         return YES;
@@ -256,6 +271,7 @@ static NSString *const kLastShownPresetFilenameKey = @"RoonVisLastShownPresetFil
         NSString *presetName = [self presetDisplayNameForPath:path];
 
         _currentPresetIndex = nextIndex;
+        [self updateRotationEngineAnchor]; // R2: anchor tracks the in-flight request
         self.requestedPresetName = presetName;
         _lastPresetLoadFailed = NO;
         [self notifyEngineStateDidChange];
@@ -263,6 +279,15 @@ static NSString *const kLastShownPresetFilenameKey = @"RoonVisLastShownPresetFil
                    static_cast<long>(offset),
                    smooth ? @"YES" : @"NO",
                    presetName);
+        if (RoonVisEffectiveRotationMode([RoonVisSettings sharedSettings].presetRotationMode) ==
+            RoonVisPresetRotationModeCategory)
+        {
+            // Structured line for device/sim verification: rotation must stay
+            // within the playing preset's category.
+            RoonVisLog(@"ProjectM rotation: mode=category category=%@ preset=%@",
+                       [self presetCategoryAtIndex:nextIndex] ?: @"(none)",
+                       presetName);
+        }
         [self recordPresetLoadAttemptForFilename:presetName];
 
         BOOL activatedPreload = NO;
@@ -317,10 +342,10 @@ static NSString *const kLastShownPresetFilenameKey = @"RoonVisLastShownPresetFil
         if (!_lastPresetLoadFailed && [self.requestedPresetName isEqualToString:presetName])
         {
             _confirmedPresetIndex = _currentPresetIndex;
+            [self updateRotationEngineAnchor]; // R2: anchor tracks the confirm
             self.confirmedPresetName = presetName;
-            _lastPresetSwitchTime = CACurrentMediaTime();
-            _preloadAttemptPresetIndex = SIZE_MAX;
-            _preloadAttemptPresetPath.clear();
+            // A5: funnel — sets _lastPresetSwitchTime and recomputes the dwell plans.
+            [self noteSwitchConfirmedAtTime:CACurrentMediaTime()];
             if (activatedPreload)
             {
                 // A primary-preload activation IS the warm hit: mark the preset so the
@@ -385,6 +410,19 @@ static NSString *const kLastShownPresetFilenameKey = @"RoonVisLastShownPresetFil
                        presetName, catastrophic);
         }
     }
+
+    // Mirror into the RotationEngine. The exclusion set (_slowPresetNames)
+    // always changed -> SetSlowNames (advance-time filter; does NOT reseed). A
+    // confirmed-promotion (nowLearnedSlow) changes the fingerprint input ->
+    // SetLearnedSlowConfirmed (may reseed + dirty -> drain/persist). R1: only
+    // the promotion leg can churn persisted orders.
+    [self pushRotationEngineSlow];
+    // A confirmed-promotion may have reseeded a scope (fingerprint changed); drain
+    // it. A no-op when nothing dirtied (session-only marks never reseed).
+    [self drainRotationEngineDirtyScopes];
+    // A5: the slow set changed what the next preset may be — recompute the dwell plans
+    // (after the engine push, so the rotation walk sees the new exclusion).
+    [self recomputeDwellPlansAtTime:CACurrentMediaTime()];
 }
 
 - (void)setPresetRotationHeld:(BOOL)held
@@ -436,9 +474,12 @@ static NSString *const kLastShownPresetFilenameKey = @"RoonVisLastShownPresetFil
         return;
     }
 
+    // addHiddenPresetFilename posts the settings-change notification synchronously,
+    // so the router has already pushed SetHidden into the engine by the time the
+    // advance below runs. (The former _browsePresetOrderIndexes rebuild fed dead,
+    // write-only state and is gone with it.)
     [[RoonVisSettings sharedSettings] addHiddenPresetFilename:presetFilename];
     RoonVisLog(@"Preset hidden: %@", presetFilename);
-    _browsePresetOrderIndexes = [self rotationCandidateIndexesForMode:RoonVisPresetRotationModeLoop];
     if ([self.confirmedPresetName isEqualToString:presetFilename])
     {
         [self selectNextPresetSmooth:[self settingsTransitionUsesSmoothCut]];
@@ -508,6 +549,7 @@ static NSString *const kLastShownPresetFilenameKey = @"RoonVisLastShownPresetFil
         case RoonVis::PresetRotationScheduler::FailureAction::RevertToLastGood:
         {
             _currentPresetIndex = _lastGoodPresetIndex;
+            [self updateRotationEngineAnchor]; // R2: anchor tracks the revert
             const std::string &path = _presetPaths[_currentPresetIndex];
             NSString *presetName = [self presetDisplayNameForPath:path];
             self.requestedPresetName = presetName;
@@ -521,10 +563,10 @@ static NSString *const kLastShownPresetFilenameKey = @"RoonVisLastShownPresetFil
             if (!_lastPresetLoadFailed && [self.requestedPresetName isEqualToString:presetName])
             {
                 _confirmedPresetIndex = _currentPresetIndex;
+                [self updateRotationEngineAnchor]; // R2: anchor tracks the revert confirm
                 self.confirmedPresetName = presetName;
-                _lastPresetSwitchTime = CACurrentMediaTime();
-                _preloadAttemptPresetIndex = SIZE_MAX;
-                _preloadAttemptPresetPath.clear();
+                // A5: funnel — sets _lastPresetSwitchTime and recomputes the dwell plans.
+                [self noteSwitchConfirmedAtTime:CACurrentMediaTime()];
                 RoonVisLog(@"Preset switch failed: %@: %@; skip cap reached, reverting to last-good %@",
                            filename.lastPathComponent,
                            error,

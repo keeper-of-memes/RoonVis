@@ -35,6 +35,7 @@ static NSString *const kTransitionStyleInstantValue = @"instant";
 static NSString *const kPresetRotationModeLoopValue = @"loop";
 static NSString *const kPresetRotationModeShuffleValue = @"shuffle";
 static NSString *const kPresetRotationModeFavoritesValue = @"favorites";
+static NSString *const kPresetRotationModeCategoryValue = @"category";
 static NSString *const kDrawableSizePreset720pValue = @"720p";
 static NSString *const kDrawableSizePreset1080pValue = @"1080p";
 static NSString *const kDrawableSizePreset1440pValue = @"1440p";
@@ -157,10 +158,173 @@ static NSSet<NSString *> *FilenameSetFromDefaultsValue(id value)
 }
 
 @implementation RoonVisSettings
+{
+    // Truth-in-memory: after -init these ivars ARE the settings; NSUserDefaults
+    // is write-through persistence only. Nothing reads NSUserDefaults after
+    // -init returns (all access is main-thread — no locking).
+    NSInteger _rotationIntervalSeconds;
+    RoonVisPresetRotationMode _rotationMode;
+    RoonVisTransitionStyle _transitionStyle;
+    double _crossfadeDurationSeconds;
+    double _beatHardCutSensitivity;
+    double _audioSensitivity;
+    NSInteger _audioInputDelayMs;
+    NSInteger _warpMeshWidth;
+    BOOL _diagnosticsOverlayEnabled;
+    NSInteger _frameRateCap;
+    RoonVisDrawableSizePreset _drawableSizePreset;
+    NSString *_snapcastServerHost;               // copied
+    NSSet<NSString *> *_favoriteFilenames;       // immutable, retained
+    NSSet<NSString *> *_hiddenFilenames;         // immutable, retained
+    NSUInteger _librarySetsRevision;
+}
 
 + (void)load
 {
     [self registerDefaults];
+}
+
+- (instancetype)init
+{
+    self = [super init];
+    if (self == nil)
+    {
+        return nil;
+    }
+
+    [RoonVisSettings registerDefaults];
+
+    // THE ONLY defaults reads in the object's lifetime. Each mirrors the exact
+    // (pre-truth-in-memory) getter logic, clamped so the ivar is valid; the
+    // device tier is static per launch, so clamp-at-init+set keeps it valid.
+    NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+
+    _rotationIntervalSeconds = ClampIntegerToStep([defaults integerForKey:RoonVisSettingsRotationIntervalSecondsKey],
+                                                  kRotationIntervalMinimum, kRotationIntervalMaximum, kRotationIntervalStep);
+
+    _rotationMode = [self resolveInitialRotationModeWithDefaults:defaults];
+
+    {
+        NSString *style = [defaults stringForKey:RoonVisSettingsTransitionStyleKey];
+        _transitionStyle = [style isEqualToString:kTransitionStyleInstantValue] ? RoonVisTransitionStyleInstant
+                                                                                : RoonVisTransitionStyleCrossfade;
+    }
+
+    _crossfadeDurationSeconds = ClampDoubleToStep([defaults doubleForKey:RoonVisSettingsCrossfadeDurationSecondsKey],
+                                                  kCrossfadeDurationMinimum, kCrossfadeDurationMaximum, kCrossfadeDurationStep);
+
+    _beatHardCutSensitivity = ClampDoubleToStep([defaults doubleForKey:RoonVisSettingsBeatHardCutSensitivityKey],
+                                                kBeatHardCutSensitivityMinimum, kBeatHardCutSensitivityMaximum, kBeatHardCutSensitivityStep);
+
+    _audioSensitivity = ClampDoubleToStep([defaults doubleForKey:RoonVisSettingsAudioSensitivityKey],
+                                          kAudioSensitivityMinimum, kAudioSensitivityMaximum, kAudioSensitivityStep);
+
+    _audioInputDelayMs = ClampIntegerToStep([defaults integerForKey:RoonVisSettingsAudioInputDelayMsKey],
+                                            kAudioInputDelayMinimumMs, kAudioInputDelayMaximumMs, kAudioInputDelayStepMs);
+
+    _warpMeshWidth = ClampIntegerToStep([defaults integerForKey:RoonVisSettingsWarpMeshWidthKey],
+                                        kWarpMeshWidthMinimum, kWarpMeshWidthMaximum, kWarpMeshWidthStep);
+
+    _diagnosticsOverlayEnabled = [defaults boolForKey:RoonVisSettingsDiagnosticsOverlayEnabledKey];
+
+    {
+        NSInteger stored = [defaults integerForKey:RoonVisSettingsFrameRateCapKey];
+        if (stored <= 0)
+        {
+            stored = RoonVisDefaultFrameRateForCurrentTier();
+        }
+        _frameRateCap = RoonVis::SnapFrameRateCap(static_cast<int>(stored));
+    }
+
+    {
+        id value = [defaults objectForKey:RoonVisSettingsDrawableSizePresetKey];
+        RoonVisDrawableSizePreset preset = RoonVisDefaultDrawablePresetForCurrentTier();
+        if ([value isKindOfClass:NSString.class])
+        {
+            NSString *stored = static_cast<NSString *>(value);
+            if ([stored isEqualToString:kDrawableSizePreset720pValue])
+            {
+                preset = RoonVisDrawableSizePreset720p;
+            }
+            else if ([stored isEqualToString:kDrawableSizePreset1080pValue])
+            {
+                preset = RoonVisDrawableSizePreset1080p;
+            }
+            else if ([stored isEqualToString:kDrawableSizePreset1440pValue])
+            {
+                preset = RoonVisDrawableSizePreset1440p;
+            }
+            else if ([stored isEqualToString:kDrawableSizePreset4KValue])
+            {
+                preset = RoonVisDrawableSizePreset4K;
+            }
+        }
+        _drawableSizePreset = ClampDrawableSizePresetToTier(preset);
+    }
+
+    {
+        NSString *stored = NormalizedHostOrEmpty([defaults stringForKey:RoonVisSettingsSnapcastServerHostKey]);
+        _snapcastServerHost = [(stored.length > 0 ? stored : InfoPlistSnapcastHost()) copy];
+    }
+
+    _favoriteFilenames = [FilenameSetFromDefaultsValue([defaults objectForKey:RoonVisSettingsFavoritePresetFilenamesKey]) copy];
+    _hiddenFilenames = [FilenameSetFromDefaultsValue([defaults objectForKey:RoonVisSettingsHiddenPresetFilenamesKey]) copy];
+
+    _librarySetsRevision = 0;
+
+    return self;
+}
+
+// One-shot presetRotationMode migration. The registered default masks the
+// "never set" state, so we probe the persistent domain (per commit 3862e610)
+// to distinguish it and fall back to the legacy favoritesOnlyRotation bool.
+// Runs EXACTLY ONCE (from -init), INCLUDING the write-back that makes the
+// migration one-shot; the domain is never materialized again afterward.
+- (RoonVisPresetRotationMode)resolveInitialRotationModeWithDefaults:(NSUserDefaults *)defaults
+{
+    NSString *bundleIdentifier = NSBundle.mainBundle.bundleIdentifier;
+    NSDictionary *persistentDefaults = bundleIdentifier.length > 0 ? [defaults persistentDomainForName:bundleIdentifier] : nil;
+    id value = persistentDefaults[RoonVisSettingsPresetRotationModeKey];
+    if (value == nil && bundleIdentifier.length == 0)
+    {
+        value = [defaults objectForKey:RoonVisSettingsPresetRotationModeKey];
+    }
+    if ([value isKindOfClass:NSString.class])
+    {
+        NSString *mode = static_cast<NSString *>(value);
+        if ([mode isEqualToString:kPresetRotationModeLoopValue])
+        {
+            return RoonVisPresetRotationModeLoop;
+        }
+        if ([mode isEqualToString:kPresetRotationModeFavoritesValue])
+        {
+            return RoonVisPresetRotationModeFavorites;
+        }
+        if ([mode isEqualToString:kPresetRotationModeShuffleValue])
+        {
+            return RoonVisPresetRotationModeShuffle;
+        }
+        if ([mode isEqualToString:kPresetRotationModeCategoryValue])
+        {
+            return RoonVisPresetRotationModeCategory;
+        }
+    }
+
+    if ([defaults boolForKey:RoonVisSettingsFavoritesOnlyRotationKey])
+    {
+        [defaults setObject:kPresetRotationModeFavoritesValue forKey:RoonVisSettingsPresetRotationModeKey];
+        return RoonVisPresetRotationModeFavorites;
+    }
+    return RoonVisPresetRotationModeShuffle;
+}
+
+- (void)dealloc
+{
+    // The singleton never deallocs, but MRC hygiene is repo policy.
+    [_snapcastServerHost release];
+    [_favoriteFilenames release];
+    [_hiddenFilenames release];
+    [super dealloc];
 }
 
 + (instancetype)sharedSettings
@@ -192,7 +356,7 @@ static NSSet<NSString *> *FilenameSetFromDefaultsValue(id value)
             RoonVisSettingsCrossfadeDurationSecondsKey: @(3.0),
             RoonVisSettingsBeatHardCutSensitivityKey: @(1.0),
             RoonVisSettingsAudioSensitivityKey: @(1.0),
-            RoonVisSettingsAudioInputDelayMsKey: @(270),
+            RoonVisSettingsAudioInputDelayMsKey: @(280),
             RoonVisSettingsWarpMeshWidthKey: @(RoonVisDefaultWarpMeshWidthForCurrentTier()),
             RoonVisSettingsFavoritesOnlyRotationKey: @NO,
             RoonVisSettingsDiagnosticsOverlayEnabledKey: @NO,
@@ -208,12 +372,6 @@ static NSSet<NSString *> *FilenameSetFromDefaultsValue(id value)
     });
 }
 
-- (NSUserDefaults *)defaults
-{
-    [RoonVisSettings registerDefaults];
-    return [NSUserDefaults standardUserDefaults];
-}
-
 - (void)postChangeNotificationForKey:(NSString *)key
 {
     [[NSNotificationCenter defaultCenter] postNotificationName:RoonVisSettingsDidChangeNotification
@@ -223,72 +381,43 @@ static NSSet<NSString *> *FilenameSetFromDefaultsValue(id value)
 
 - (NSInteger)rotationIntervalSeconds
 {
-    NSInteger value = [[self defaults] integerForKey:RoonVisSettingsRotationIntervalSecondsKey];
-    return ClampIntegerToStep(value, kRotationIntervalMinimum, kRotationIntervalMaximum, kRotationIntervalStep);
+    return _rotationIntervalSeconds;
 }
 
 - (void)setRotationIntervalSeconds:(NSInteger)rotationIntervalSeconds
 {
     NSInteger clamped = ClampIntegerToStep(rotationIntervalSeconds, kRotationIntervalMinimum, kRotationIntervalMaximum, kRotationIntervalStep);
-    if (self.rotationIntervalSeconds == clamped)
+    if (_rotationIntervalSeconds == clamped)
     {
         return;
     }
-    [[self defaults] setInteger:clamped forKey:RoonVisSettingsRotationIntervalSecondsKey];
+    _rotationIntervalSeconds = clamped;
+    [[NSUserDefaults standardUserDefaults] setInteger:clamped forKey:RoonVisSettingsRotationIntervalSecondsKey];
     RoonVisLog(@"Settings changed: rotationIntervalSeconds=%ld", static_cast<long>(clamped));
     [self postChangeNotificationForKey:RoonVisSettingsRotationIntervalSecondsKey];
 }
 
 - (NSInteger)warpMeshWidth
 {
-    NSInteger value = [[self defaults] integerForKey:RoonVisSettingsWarpMeshWidthKey];
-    return ClampIntegerToStep(value, kWarpMeshWidthMinimum, kWarpMeshWidthMaximum, kWarpMeshWidthStep);
+    return _warpMeshWidth;
 }
 
 - (void)setWarpMeshWidth:(NSInteger)warpMeshWidth
 {
     NSInteger clamped = ClampIntegerToStep(warpMeshWidth, kWarpMeshWidthMinimum, kWarpMeshWidthMaximum, kWarpMeshWidthStep);
-    if (self.warpMeshWidth == clamped)
+    if (_warpMeshWidth == clamped)
     {
         return;
     }
-    [[self defaults] setInteger:clamped forKey:RoonVisSettingsWarpMeshWidthKey];
+    _warpMeshWidth = clamped;
+    [[NSUserDefaults standardUserDefaults] setInteger:clamped forKey:RoonVisSettingsWarpMeshWidthKey];
     RoonVisLog(@"Settings changed: warpMeshWidth=%ld", static_cast<long>(clamped));
     [self postChangeNotificationForKey:RoonVisSettingsWarpMeshWidthKey];
 }
 
 - (RoonVisPresetRotationMode)presetRotationMode
 {
-    NSString *bundleIdentifier = NSBundle.mainBundle.bundleIdentifier;
-    NSDictionary *persistentDefaults = bundleIdentifier.length > 0 ? [[self defaults] persistentDomainForName:bundleIdentifier] : nil;
-    id value = persistentDefaults[RoonVisSettingsPresetRotationModeKey];
-    if (value == nil && bundleIdentifier.length == 0)
-    {
-        value = [[self defaults] objectForKey:RoonVisSettingsPresetRotationModeKey];
-    }
-    if ([value isKindOfClass:NSString.class])
-    {
-        NSString *mode = static_cast<NSString *>(value);
-        if ([mode isEqualToString:kPresetRotationModeLoopValue])
-        {
-            return RoonVisPresetRotationModeLoop;
-        }
-        if ([mode isEqualToString:kPresetRotationModeFavoritesValue])
-        {
-            return RoonVisPresetRotationModeFavorites;
-        }
-        if ([mode isEqualToString:kPresetRotationModeShuffleValue])
-        {
-            return RoonVisPresetRotationModeShuffle;
-        }
-    }
-
-    if ([[self defaults] boolForKey:RoonVisSettingsFavoritesOnlyRotationKey])
-    {
-        [[self defaults] setObject:kPresetRotationModeFavoritesValue forKey:RoonVisSettingsPresetRotationModeKey];
-        return RoonVisPresetRotationModeFavorites;
-    }
-    return RoonVisPresetRotationModeShuffle;
+    return _rotationMode;
 }
 
 - (void)setPresetRotationMode:(RoonVisPresetRotationMode)presetRotationMode
@@ -305,10 +434,13 @@ static NSSet<NSString *> *FilenameSetFromDefaultsValue(id value)
         case RoonVisPresetRotationModeShuffle:
             mode = kPresetRotationModeShuffleValue;
             break;
+        case RoonVisPresetRotationModeCategory:
+            mode = kPresetRotationModeCategoryValue;
+            break;
     }
 
     NSString *currentMode = kPresetRotationModeShuffleValue;
-    switch (self.presetRotationMode)
+    switch (_rotationMode)
     {
         case RoonVisPresetRotationModeLoop:
             currentMode = kPresetRotationModeLoopValue;
@@ -319,194 +451,169 @@ static NSSet<NSString *> *FilenameSetFromDefaultsValue(id value)
         case RoonVisPresetRotationModeShuffle:
             currentMode = kPresetRotationModeShuffleValue;
             break;
+        case RoonVisPresetRotationModeCategory:
+            currentMode = kPresetRotationModeCategoryValue;
+            break;
     }
     if ([currentMode isEqualToString:mode])
     {
         return;
     }
 
-    [[self defaults] setObject:mode forKey:RoonVisSettingsPresetRotationModeKey];
+    _rotationMode = presetRotationMode;
+    [[NSUserDefaults standardUserDefaults] setObject:mode forKey:RoonVisSettingsPresetRotationModeKey];
     RoonVisLog(@"Settings changed: presetRotationMode=%@", mode);
     [self postChangeNotificationForKey:RoonVisSettingsPresetRotationModeKey];
 }
 
 - (RoonVisTransitionStyle)transitionStyle
 {
-    NSString *style = [[self defaults] stringForKey:RoonVisSettingsTransitionStyleKey];
-    if ([style isEqualToString:kTransitionStyleInstantValue])
-    {
-        return RoonVisTransitionStyleInstant;
-    }
-    return RoonVisTransitionStyleCrossfade;
+    return _transitionStyle;
 }
 
 - (void)setTransitionStyle:(RoonVisTransitionStyle)transitionStyle
 {
     NSString *style = transitionStyle == RoonVisTransitionStyleInstant ? kTransitionStyleInstantValue : kTransitionStyleCrossfadeValue;
-    NSString *currentStyle = self.transitionStyle == RoonVisTransitionStyleInstant ? kTransitionStyleInstantValue : kTransitionStyleCrossfadeValue;
+    NSString *currentStyle = _transitionStyle == RoonVisTransitionStyleInstant ? kTransitionStyleInstantValue : kTransitionStyleCrossfadeValue;
     if ([currentStyle isEqualToString:style])
     {
         return;
     }
-    [[self defaults] setObject:style forKey:RoonVisSettingsTransitionStyleKey];
+    _transitionStyle = transitionStyle == RoonVisTransitionStyleInstant ? RoonVisTransitionStyleInstant : RoonVisTransitionStyleCrossfade;
+    [[NSUserDefaults standardUserDefaults] setObject:style forKey:RoonVisSettingsTransitionStyleKey];
     RoonVisLog(@"Settings changed: transitionStyle=%@", style);
     [self postChangeNotificationForKey:RoonVisSettingsTransitionStyleKey];
 }
 
 - (double)crossfadeDurationSeconds
 {
-    double value = [[self defaults] doubleForKey:RoonVisSettingsCrossfadeDurationSecondsKey];
-    return ClampDoubleToStep(value, kCrossfadeDurationMinimum, kCrossfadeDurationMaximum, kCrossfadeDurationStep);
+    return _crossfadeDurationSeconds;
 }
 
 - (void)setCrossfadeDurationSeconds:(double)crossfadeDurationSeconds
 {
     double clamped = ClampDoubleToStep(crossfadeDurationSeconds, kCrossfadeDurationMinimum, kCrossfadeDurationMaximum, kCrossfadeDurationStep);
-    if (self.crossfadeDurationSeconds == clamped)
+    if (_crossfadeDurationSeconds == clamped)
     {
         return;
     }
-    [[self defaults] setDouble:clamped forKey:RoonVisSettingsCrossfadeDurationSecondsKey];
+    _crossfadeDurationSeconds = clamped;
+    [[NSUserDefaults standardUserDefaults] setDouble:clamped forKey:RoonVisSettingsCrossfadeDurationSecondsKey];
     RoonVisLog(@"Settings changed: crossfadeDurationSeconds=%.1f", clamped);
     [self postChangeNotificationForKey:RoonVisSettingsCrossfadeDurationSecondsKey];
 }
 
 - (double)beatHardCutSensitivity
 {
-    double value = [[self defaults] doubleForKey:RoonVisSettingsBeatHardCutSensitivityKey];
-    return ClampDoubleToStep(value, kBeatHardCutSensitivityMinimum, kBeatHardCutSensitivityMaximum, kBeatHardCutSensitivityStep);
+    return _beatHardCutSensitivity;
 }
 
 - (void)setBeatHardCutSensitivity:(double)beatHardCutSensitivity
 {
     double clamped = ClampDoubleToStep(beatHardCutSensitivity, kBeatHardCutSensitivityMinimum, kBeatHardCutSensitivityMaximum, kBeatHardCutSensitivityStep);
-    if (self.beatHardCutSensitivity == clamped)
+    if (_beatHardCutSensitivity == clamped)
     {
         return;
     }
-    [[self defaults] setDouble:clamped forKey:RoonVisSettingsBeatHardCutSensitivityKey];
+    _beatHardCutSensitivity = clamped;
+    [[NSUserDefaults standardUserDefaults] setDouble:clamped forKey:RoonVisSettingsBeatHardCutSensitivityKey];
     RoonVisLog(@"Settings changed: beatHardCutSensitivity=%.2f", clamped);
     [self postChangeNotificationForKey:RoonVisSettingsBeatHardCutSensitivityKey];
 }
 
 - (double)audioSensitivity
 {
-    double value = [[self defaults] doubleForKey:RoonVisSettingsAudioSensitivityKey];
-    return ClampDoubleToStep(value, kAudioSensitivityMinimum, kAudioSensitivityMaximum, kAudioSensitivityStep);
+    return _audioSensitivity;
 }
 
 - (void)setAudioSensitivity:(double)audioSensitivity
 {
     double clamped = ClampDoubleToStep(audioSensitivity, kAudioSensitivityMinimum, kAudioSensitivityMaximum, kAudioSensitivityStep);
-    if (self.audioSensitivity == clamped)
+    if (_audioSensitivity == clamped)
     {
         return;
     }
-    [[self defaults] setDouble:clamped forKey:RoonVisSettingsAudioSensitivityKey];
+    _audioSensitivity = clamped;
+    [[NSUserDefaults standardUserDefaults] setDouble:clamped forKey:RoonVisSettingsAudioSensitivityKey];
     RoonVisLog(@"Settings changed: audioSensitivity=%.1f", clamped);
     [self postChangeNotificationForKey:RoonVisSettingsAudioSensitivityKey];
 }
 
 - (NSInteger)audioInputDelayMs
 {
-    NSInteger value = [[self defaults] integerForKey:RoonVisSettingsAudioInputDelayMsKey];
-    return ClampIntegerToStep(value, kAudioInputDelayMinimumMs, kAudioInputDelayMaximumMs, kAudioInputDelayStepMs);
+    return _audioInputDelayMs;
 }
 
 - (void)setAudioInputDelayMs:(NSInteger)audioInputDelayMs
 {
     NSInteger clamped = ClampIntegerToStep(audioInputDelayMs, kAudioInputDelayMinimumMs, kAudioInputDelayMaximumMs, kAudioInputDelayStepMs);
-    if (self.audioInputDelayMs == clamped)
+    if (_audioInputDelayMs == clamped)
     {
         return;
     }
-    [[self defaults] setInteger:clamped forKey:RoonVisSettingsAudioInputDelayMsKey];
+    _audioInputDelayMs = clamped;
+    [[NSUserDefaults standardUserDefaults] setInteger:clamped forKey:RoonVisSettingsAudioInputDelayMsKey];
     RoonVisLog(@"Settings changed: audioInputDelayMs=%ld", static_cast<long>(clamped));
     [self postChangeNotificationForKey:RoonVisSettingsAudioInputDelayMsKey];
 }
 
 - (BOOL)isDiagnosticsOverlayEnabled
 {
-    return [[self defaults] boolForKey:RoonVisSettingsDiagnosticsOverlayEnabledKey];
+    return _diagnosticsOverlayEnabled;
 }
 
 - (void)setDiagnosticsOverlayEnabled:(BOOL)diagnosticsOverlayEnabled
 {
-    if (self.diagnosticsOverlayEnabled == diagnosticsOverlayEnabled)
+    if (_diagnosticsOverlayEnabled == diagnosticsOverlayEnabled)
     {
         return;
     }
-    [[self defaults] setBool:diagnosticsOverlayEnabled forKey:RoonVisSettingsDiagnosticsOverlayEnabledKey];
+    _diagnosticsOverlayEnabled = diagnosticsOverlayEnabled;
+    [[NSUserDefaults standardUserDefaults] setBool:diagnosticsOverlayEnabled forKey:RoonVisSettingsDiagnosticsOverlayEnabledKey];
     RoonVisLog(@"Settings changed: diagnosticsOverlayEnabled=%@", diagnosticsOverlayEnabled ? @"YES" : @"NO");
     [self postChangeNotificationForKey:RoonVisSettingsDiagnosticsOverlayEnabledKey];
 }
 
 - (NSInteger)frameRateCap
 {
-    NSInteger stored = [[self defaults] integerForKey:RoonVisSettingsFrameRateCapKey];
-    if (stored <= 0)
-    {
-        stored = RoonVisDefaultFrameRateForCurrentTier();
-    }
-    return RoonVis::SnapFrameRateCap(static_cast<int>(stored));
+    return _frameRateCap;
 }
 
 - (void)setFrameRateCap:(NSInteger)frameRateCap
 {
     NSInteger snapped = RoonVis::SnapFrameRateCap(static_cast<int>(frameRateCap));
-    if (self.frameRateCap == snapped)
+    if (_frameRateCap == snapped)
     {
         return;
     }
-    [[self defaults] setInteger:snapped forKey:RoonVisSettingsFrameRateCapKey];
+    _frameRateCap = snapped;
+    [[NSUserDefaults standardUserDefaults] setInteger:snapped forKey:RoonVisSettingsFrameRateCapKey];
     RoonVisLog(@"Settings changed: frameRateCap=%ld", static_cast<long>(snapped));
     [self postChangeNotificationForKey:RoonVisSettingsFrameRateCapKey];
 }
 
 - (RoonVisDrawableSizePreset)drawableSizePreset
 {
-    id value = [[self defaults] objectForKey:RoonVisSettingsDrawableSizePresetKey];
-    RoonVisDrawableSizePreset preset = RoonVisDefaultDrawablePresetForCurrentTier();
-    if ([value isKindOfClass:NSString.class])
-    {
-        NSString *stored = static_cast<NSString *>(value);
-        if ([stored isEqualToString:kDrawableSizePreset720pValue])
-        {
-            preset = RoonVisDrawableSizePreset720p;
-        }
-        else if ([stored isEqualToString:kDrawableSizePreset1080pValue])
-        {
-            preset = RoonVisDrawableSizePreset1080p;
-        }
-        else if ([stored isEqualToString:kDrawableSizePreset1440pValue])
-        {
-            preset = RoonVisDrawableSizePreset1440p;
-        }
-        else if ([stored isEqualToString:kDrawableSizePreset4KValue])
-        {
-            preset = RoonVisDrawableSizePreset4K;
-        }
-    }
-    return ClampDrawableSizePresetToTier(preset);
+    return _drawableSizePreset;
 }
 
 - (void)setDrawableSizePreset:(RoonVisDrawableSizePreset)drawableSizePreset
 {
     RoonVisDrawableSizePreset clamped = ClampDrawableSizePresetToTier(drawableSizePreset);
-    if (self.drawableSizePreset == clamped)
+    if (_drawableSizePreset == clamped)
     {
         return;
     }
-    [[self defaults] setObject:DrawableSizePresetPersistedValue(clamped)
-                        forKey:RoonVisSettingsDrawableSizePresetKey];
+    _drawableSizePreset = clamped;
+    [[NSUserDefaults standardUserDefaults] setObject:DrawableSizePresetPersistedValue(clamped)
+                                              forKey:RoonVisSettingsDrawableSizePresetKey];
     RoonVisLog(@"Settings changed: drawableSizePreset=%@", RoonVisDrawableSizePresetLabel(clamped));
     [self postChangeNotificationForKey:RoonVisSettingsDrawableSizePresetKey];
 }
 
 - (NSString *)snapcastServerHost
 {
-    NSString *stored = NormalizedHostOrEmpty([[self defaults] stringForKey:RoonVisSettingsSnapcastServerHostKey]);
-    return stored.length > 0 ? stored : InfoPlistSnapcastHost();
+    return _snapcastServerHost;
 }
 
 - (void)setSnapcastServerHost:(NSString *)snapcastServerHost
@@ -516,54 +623,67 @@ static NSSet<NSString *> *FilenameSetFromDefaultsValue(id value)
     {
         normalized = InfoPlistSnapcastHost();
     }
-    if ([self.snapcastServerHost isEqualToString:normalized])
+    if ([_snapcastServerHost isEqualToString:normalized])
     {
         return;
     }
-    [[self defaults] setObject:normalized forKey:RoonVisSettingsSnapcastServerHostKey];
+    [_snapcastServerHost release];
+    _snapcastServerHost = [normalized copy];
+    [[NSUserDefaults standardUserDefaults] setObject:normalized forKey:RoonVisSettingsSnapcastServerHostKey];
     RoonVisLog(@"Settings changed: snapcastServerHost=%@", normalized);
     [self postChangeNotificationForKey:RoonVisSettingsSnapcastServerHostKey];
 }
 
+- (NSUInteger)librarySetsRevision
+{
+    return _librarySetsRevision;
+}
+
 - (NSSet<NSString *> *)favoritePresetFilenames
 {
-    return FilenameSetFromDefaultsValue([[self defaults] objectForKey:RoonVisSettingsFavoritePresetFilenamesKey]);
+    return _favoriteFilenames;
 }
 
 - (void)setFavoritePresetFilenames:(NSSet<NSString *> *)favoritePresetFilenames
 {
     NSArray<NSString *> *filenames = SortedFilenameArrayFromSet(favoritePresetFilenames);
-    NSArray<NSString *> *currentFilenames = SortedFilenameArrayFromSet(self.favoritePresetFilenames);
+    NSArray<NSString *> *currentFilenames = SortedFilenameArrayFromSet(_favoriteFilenames);
     if ([currentFilenames isEqualToArray:filenames])
     {
         return;
     }
-    [[self defaults] setObject:filenames forKey:RoonVisSettingsFavoritePresetFilenamesKey];
+    [_favoriteFilenames release];
+    _favoriteFilenames = [[NSSet alloc] initWithArray:filenames];
+    _librarySetsRevision++;
+    [[NSUserDefaults standardUserDefaults] setObject:filenames forKey:RoonVisSettingsFavoritePresetFilenamesKey];
     RoonVisLog(@"Settings changed: favoritePresetFilenames count=%lu", static_cast<unsigned long>(filenames.count));
     [self postChangeNotificationForKey:RoonVisSettingsFavoritePresetFilenamesKey];
 }
 
 - (NSSet<NSString *> *)hiddenPresetFilenames
 {
-    return FilenameSetFromDefaultsValue([[self defaults] objectForKey:RoonVisSettingsHiddenPresetFilenamesKey]);
+    return _hiddenFilenames;
 }
 
 - (void)setHiddenPresetFilenames:(NSSet<NSString *> *)hiddenPresetFilenames
 {
     NSArray<NSString *> *filenames = SortedFilenameArrayFromSet(hiddenPresetFilenames);
-    NSArray<NSString *> *currentFilenames = SortedFilenameArrayFromSet(self.hiddenPresetFilenames);
+    NSArray<NSString *> *currentFilenames = SortedFilenameArrayFromSet(_hiddenFilenames);
     if ([currentFilenames isEqualToArray:filenames])
     {
         return;
     }
-    [[self defaults] setObject:filenames forKey:RoonVisSettingsHiddenPresetFilenamesKey];
+    [_hiddenFilenames release];
+    _hiddenFilenames = [[NSSet alloc] initWithArray:filenames];
+    _librarySetsRevision++;
+    [[NSUserDefaults standardUserDefaults] setObject:filenames forKey:RoonVisSettingsHiddenPresetFilenamesKey];
     RoonVisLog(@"Settings changed: hiddenPresetFilenames count=%lu", static_cast<unsigned long>(filenames.count));
     [self postChangeNotificationForKey:RoonVisSettingsHiddenPresetFilenamesKey];
 }
 
 - (BOOL)isFavoritePresetFilename:(NSString *)filename
 {
-    return filename.length > 0 && [self.favoritePresetFilenames containsObject:filename];
+    return filename.length > 0 && [_favoriteFilenames containsObject:filename];
 }
 
 - (void)addFavoritePresetFilename:(NSString *)filename
@@ -590,7 +710,7 @@ static NSSet<NSString *> *FilenameSetFromDefaultsValue(id value)
 
 - (BOOL)isHiddenPresetFilename:(NSString *)filename
 {
-    return filename.length > 0 && [self.hiddenPresetFilenames containsObject:filename];
+    return filename.length > 0 && [_hiddenFilenames containsObject:filename];
 }
 
 - (void)addHiddenPresetFilename:(NSString *)filename

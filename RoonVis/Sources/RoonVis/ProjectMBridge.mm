@@ -1,8 +1,17 @@
 #import "ProjectMBridgeInternal.h"
 
-#include "PresetRotationCursor.h"
+// The bridge is deliberately split across category files (+Audio/+Presets/+Warm);
+// methods declared in the class extension are defined there, which this file's
+// @implementation cannot see — a structural false positive of the split, not a
+// missing definition (the linker catches genuinely missing ones).
+#pragma clang diagnostic ignored "-Wincomplete-implementation"
 
+#include "PresetRotationCursor.h"
+#include "PreprocessCacheResource.h"
+
+#import "RoonVisCapabilityCatalog.h"
 #import "RoonVisCrashReporter.h"
+#import "RoonVisPerfDiagnosticsSink.h"
 
 #import <EGL/egl.h>
 #import <UIKit/UIScreen.h>
@@ -14,6 +23,7 @@
 #include <cstdint>
 #include <cstring>
 #include <random>
+#include <unordered_map>
 
 NSNotificationName const RoonVisEngineStateDidChangeNotification = @"RoonVisEngineStateDidChangeNotification";
 
@@ -150,10 +160,10 @@ static void PreprocessCachePut(void *user, const char *key, size_t keylen,
 }
 
 // Seed the runtime cache from the build-time-generated resource so the FIRST load of any
-// bundled preset is a cache hit (no transpile stutter). Little-endian format written by the
-// PreprocessCacheGen host tool:
-//   magic "RVPP" · u32 version(=1) · u32 saltLen+salt · u32 entryCount ·
-//   (u32 keyLen+key · u32 valLen+val)*
+// bundled preset is a cache hit (no transpile stutter). RVPP container written by the
+// PreprocessCacheGen host tool — v1 (preprocess-only) and v2 (stage-tagged: preprocessed
+// HLSL + Tier-1 parse/generate GLSL) both seed into the ONE cache; the binary parse lives
+// in the shared, host-testable PreprocessCacheResource.cpp (format doc there).
 // Staleness-safe: a stale entry (salt bump / preset edit) just yields a runtime key miss ->
 // live transpile. So a missing / malformed / short file is a warning and no-op, never wrong.
 static void SeedPreprocessCacheFromResource(RoonVis::PreprocessCache &cache)
@@ -167,69 +177,30 @@ static void SeedPreprocessCacheFromResource(RoonVis::PreprocessCache &cache)
         return;
     }
 
-    const uint8_t *bytes = static_cast<const uint8_t *>(data.bytes);
-    const size_t size = data.length;
-    size_t off = 0;
-
-    auto readU32 = [&](uint32_t &out) -> bool {
-        if (off + 4 > size)
-        {
-            return false;
-        }
-        out = static_cast<uint32_t>(bytes[off]) |
-              (static_cast<uint32_t>(bytes[off + 1]) << 8) |
-              (static_cast<uint32_t>(bytes[off + 2]) << 16) |
-              (static_cast<uint32_t>(bytes[off + 3]) << 24);
-        off += 4;
-        return true;
-    };
-    auto readStr = [&](std::string &out) -> bool {
-        uint32_t len = 0;
-        if (!readU32(len) || off + len > size)
-        {
-            return false;
-        }
-        out.assign(reinterpret_cast<const char *>(bytes + off), len);
-        off += len;
-        return true;
-    };
-
-    if (size < 4 || std::memcmp(bytes, "RVPP", 4) != 0)
+    const RoonVis::RvppSeedResult result = RoonVis::SeedPreprocessCacheFromRvppBuffer(
+        static_cast<const uint8_t *>(data.bytes), data.length, cache);
+    if (!result.ok)
     {
-        RoonVisLog(@"Preprocess cache: bad magic (no prepopulation)");
+        RoonVisLog(@"Preprocess cache: %s (no prepopulation)",
+                   result.error != nullptr ? result.error : "malformed resource");
         return;
     }
-    off = 4;
-    uint32_t version = 0;
-    if (!readU32(version) || version != 1)
+    if (result.truncated)
     {
-        RoonVisLog(@"Preprocess cache: unsupported version %u (no prepopulation)", version);
-        return;
+        RoonVisLog(@"Preprocess cache: %s (partial seed kept)",
+                   result.error != nullptr ? result.error : "truncated");
     }
-    std::string salt;
-    uint32_t entryCount = 0;
-    if (!readStr(salt) || !readU32(entryCount))
-    {
-        RoonVisLog(@"Preprocess cache: truncated header (no prepopulation)");
-        return;
-    }
-
-    // Guarantee no seed can be evicted by later runtime Puts.
-    cache.EnsureCapacity(static_cast<size_t>(entryCount) + 64);
-
-    for (uint32_t i = 0; i < entryCount; ++i)
-    {
-        std::string key;
-        std::string value;
-        if (!readStr(key) || !readStr(value))
-        {
-            RoonVisLog(@"Preprocess cache: truncated at entry %u/%u (seeded %zu so far)",
-                       i, entryCount, cache.Seeds());
-            break;
-        }
-        cache.Seed(key, std::move(value));
-    }
-    RoonVisLog(@"Preprocess cache: salt=%s seeded %zu entries", salt.c_str(), cache.Seeds());
+    RoonVisLog(@"Preprocess cache: v%u salt=%s seeded %zu preprocess + %zu parse-gen entries (%zu total)",
+               result.version, result.salt.c_str(),
+               result.preprocessEntries, result.parseGenEntries, cache.Seeds());
+#if ROONVIS_ENABLE_DIAGNOSTIC_MODES
+    // Campaign/verification visibility: RoonVisLog only reaches NSLog, which
+    // headless captures cannot pull — mirror the seed result into the
+    // perf-diagnostics file sink (same mechanism as FixedRotation/Thermal).
+    RoonVisPerfDiagnosticsSinkAppendLine(
+        [NSString stringWithFormat:@"PreprocessCacheSeed: v%u preprocess=%zu parseGen=%zu",
+                                   result.version, result.preprocessEntries, result.parseGenEntries]);
+#endif
 }
 }  // namespace
 
@@ -293,6 +264,120 @@ static std::vector<std::string> RoonVisFixedRotationListFilenames()
     return {};
 }
 
+#if ROONVIS_ENABLE_DIAGNOSTIC_MODES
+// Campaign-harness mirror support: the names in `filenames` that
+// ResolveFixedRotationIndexes would silently drop (no catalog basename match).
+// Reimplements its exact basename-match rule bridge-side (the scheduler helper
+// stays untouched); pass the same inputs the resolve call received.
+static std::vector<std::string> RoonVisUnresolvedFixedRotationFilenames(
+    const std::vector<std::string> &filenames,
+    const std::vector<std::string> &presetPaths)
+{
+    std::vector<std::string> unresolved;
+    for (const std::string &filename : filenames)
+    {
+        bool found = false;
+        for (const std::string &path : presetPaths)
+        {
+            const size_t slash = path.find_last_of('/');
+            const size_t nameStart = slash == std::string::npos ? 0 : slash + 1;
+            if (path.compare(nameStart, std::string::npos, filename) == 0)
+            {
+                found = true;
+                break;
+            }
+        }
+        if (!found)
+        {
+            unresolved.push_back(filename);
+        }
+    }
+    return unresolved;
+}
+
+// One-shot machine-readable thermal breadcrumb into the perf-diagnostics sink so
+// campaign logs record the chip's starting thermal state (a hot A8 skews render
+// timings). Diagnostic builds only, like the other campaign hooks.
+static void RoonVisEmitThermalStateBreadcrumbOnce(void)
+{
+    static BOOL emitted = NO;
+    if (emitted)
+    {
+        return;
+    }
+    emitted = YES;
+    const char *state = "nominal";
+    switch (NSProcessInfo.processInfo.thermalState)
+    {
+        case NSProcessInfoThermalStateNominal:
+            state = "nominal";
+            break;
+        case NSProcessInfoThermalStateFair:
+            state = "fair";
+            break;
+        case NSProcessInfoThermalStateSerious:
+            state = "serious";
+            break;
+        case NSProcessInfoThermalStateCritical:
+            state = "critical";
+            break;
+    }
+    RoonVisPerfDiagnosticsSinkAppendLine([NSString stringWithFormat:@"Thermal: state=%s", state]);
+}
+#endif
+
+// Maps the ObjC settings enum to the engine's RotationMode. The 4 values map 1:1;
+// any unexpected value degrades to Loop (the safe default).
+static RoonVis::RotationMode RoonVisEngineRotationMode(RoonVisPresetRotationMode mode)
+{
+    switch (mode)
+    {
+        case RoonVisPresetRotationModeShuffle:
+            return RoonVis::RotationMode::Shuffle;
+        case RoonVisPresetRotationModeFavorites:
+            return RoonVis::RotationMode::Favorites;
+        case RoonVisPresetRotationModeCategory:
+            return RoonVis::RotationMode::Category;
+        case RoonVisPresetRotationModeLoop:
+        default:
+            return RoonVis::RotationMode::Loop;
+    }
+}
+
+// Diagnostic-only launch override of the rotation mode so the on-device 4-mode
+// matrix can be driven headlessly (mirrors ROONVIS_ROTATION_FIXED_LIST). Returns
+// the settings mode unchanged in Release / when unset or unrecognized. Non-static:
+// declared in ProjectMBridgeInternal.h so the +Presets category's structured
+// category-rotation log follows the effective mode too.
+RoonVisPresetRotationMode RoonVisEffectiveRotationMode(RoonVisPresetRotationMode settingsMode)
+{
+#if ROONVIS_ENABLE_DIAGNOSTIC_MODES
+    NSString *envValue = NSProcessInfo.processInfo.environment[@"ROONVIS_ROTATION_MODE"];
+    NSString *key = [[envValue stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]] lowercaseString];
+    if (key.length > 0)
+    {
+        if ([key isEqualToString:@"loop"])
+        {
+            return RoonVisPresetRotationModeLoop;
+        }
+        if ([key isEqualToString:@"shuffle"])
+        {
+            return RoonVisPresetRotationModeShuffle;
+        }
+        if ([key isEqualToString:@"favorites"] || [key isEqualToString:@"favourites"])
+        {
+            return RoonVisPresetRotationModeFavorites;
+        }
+        if ([key isEqualToString:@"category"])
+        {
+            return RoonVisPresetRotationModeCategory;
+        }
+        RoonVisLog(@"ProjectM rotation: ignoring unrecognized ROONVIS_ROTATION_MODE=%@", envValue);
+    }
+#endif
+    return settingsMode;
+}
+
 unsigned int RoonVisDisplayRefreshRate()
 {
     NSInteger refreshRate = UIScreen.mainScreen.maximumFramesPerSecond;
@@ -334,7 +419,6 @@ void *ProjectMANGLELoadProc(const char *name, void *)
         _confirmedPresetIndex = SIZE_MAX;
         _lastGoodPresetIndex = SIZE_MAX;
         _preloadedPresetIndex = SIZE_MAX;
-        _preloadAttemptPresetIndex = SIZE_MAX;
         _presetStepDirection = 1;
         _audioInputDelayMs = 255;
         _effectiveAudioDelayMs = _audioInputDelayMs;
@@ -424,9 +508,146 @@ void *ProjectMANGLELoadProc(const char *name, void *)
         };
         projectm_set_texture_search_paths(self.projectM, texturePaths, 2);
 
-        NSArray<NSString *> *presetPaths =
-            [[NSBundle mainBundle] pathsForResourcesOfType:@"milk" inDirectory:@"presets"];
-        presetPaths = [presetPaths sortedArrayUsingSelector:@selector(compare:)];
+        NSString *presetsRoot = [resourcePath stringByAppendingPathComponent:@"presets"];
+
+        // Apple TV HD: device-verified allowlist only (no static A8 pass rule
+        // exists; the list grows exclusively via burn-in - HDVerifiedPresets.json).
+        // Loaded up front so its "paths" mirror can drive a direct catalog build
+        // (below) that SKIPS the full 7.7k-file tree walk - ~6.6s on the A8,
+        // otherwise all behind the launch screen. "presets" (names) stays the
+        // source of truth and the filter net in the loop further down.
+        NSSet<NSString *> *hdAllowlist = nil;
+        NSArray *hdAllowlistPaths = nil;
+        BOOL hdFullCatalogOverride = NO;
+#if ROONVIS_ENABLE_DIAGNOSTIC_MODES
+        // Compat-campaign hook: expose the FULL pack on the HD tier so burn-in
+        // validation can test allowlist candidates (mirrors the other diagnostic
+        // env hooks; compiled out of Release). Rotation stays governed by
+        // ROONVIS_ROTATION_FIXED_LIST during campaigns.
+        hdFullCatalogOverride =
+            NSProcessInfo.processInfo.environment[@"ROONVIS_HD_FULL_CATALOG"].boolValue;
+        if (hdFullCatalogOverride)
+        {
+            RoonVisLog(@"ProjectM pack: HD allowlist BYPASSED (ROONVIS_HD_FULL_CATALOG)");
+        }
+#endif
+        // W2b: on the HD tier the evidence-backed capability manifest
+        // (HDCapabilityManifest.json) supersedes the flat verified allowlist when
+        // — and ONLY when — it loads Valid against this tier's expected profile.
+        // FAIL-CLOSED: any other status (missing/malformed/profile-mismatch)
+        // falls through to the legacy HDVerifiedPresets.json path below, which is
+        // EXACTLY today's behavior. (Known hazard kept as-is, not widened: in the
+        // legacy path a nil allowlist still means the tree walk runs
+        // unrestricted; capability mode can never yield that state because
+        // capabilityMode == YES implies the populated visibleNames net applies.)
+        RoonVisCapabilityCatalog capabilityCatalog;
+        BOOL capabilityMode = NO;
+        if (RoonVisCurrentDeviceTier() == RoonVisDeviceTierHD && !hdFullCatalogOverride)
+        {
+            capabilityMode = RoonVisLoadHDCapabilityCatalog(capabilityCatalog);
+            if (capabilityMode)
+            {
+                RoonVisLog(@"Capability manifest valid: %zu records, %zu browse-visible, %zu rotation-eligible, %zu safety-excluded (load+eval %.1f ms)",
+                           capabilityCatalog.recordCount,
+                           capabilityCatalog.visibleNames.size(),
+                           capabilityCatalog.rotationEligibleCount,
+                           capabilityCatalog.safetyExcludedCount,
+                           capabilityCatalog.loadMillis);
+            }
+            else
+            {
+                RoonVisLog(@"Capability manifest %s: falling back to verified allowlist",
+                           RoonVisManifestLoadStatusLabel(capabilityCatalog.status));
+                NSString *allowPath = [[NSBundle mainBundle] pathForResource:@"HDVerifiedPresets" ofType:@"json"];
+                NSData *allowData = allowPath != nil ? [NSData dataWithContentsOfFile:allowPath] : nil;
+                NSDictionary *allowDict = allowData != nil
+                    ? [NSJSONSerialization JSONObjectWithData:allowData options:0 error:nil]
+                    : nil;
+                NSArray *allowNames = [allowDict isKindOfClass:[NSDictionary class]] ? allowDict[@"presets"] : nil;
+                NSArray *allowPaths = [allowDict isKindOfClass:[NSDictionary class]] ? allowDict[@"paths"] : nil;
+                if ([allowNames isKindOfClass:[NSArray class]] && allowNames.count > 0)
+                {
+                    hdAllowlist = [NSSet setWithArray:allowNames];
+                }
+                if ([allowPaths isKindOfClass:[NSArray class]] && allowPaths.count > 0)
+                {
+                    hdAllowlistPaths = allowPaths;
+                }
+                RoonVisLog(@"ProjectM pack: HD tier allowlist %lu presets",
+                           static_cast<unsigned long>(hdAllowlist.count));
+            }
+        }
+
+        // Build the raw path list. HD fast path: resolve the allowlist "paths"
+        // mirror directly (a handful of stats) when every entry exists on disk.
+        // Otherwise a recursive tree walk - the CotC pack ships as
+        // presets/<Top>/<Sub>/*.milk (NSBundle's pathsForResourcesOfType: does
+        // not recurse). The fallback also covers a stale mirror after a burn-in
+        // grows the name list without regenerating paths.
+        NSMutableArray<NSString *> *treePaths = [NSMutableArray array];
+        BOOL usedHDPathMirror = NO;
+        if (capabilityMode)
+        {
+            // Capability fast path: the manifest's pack-relative paths for the
+            // browse-visible records ARE the catalog universe (absent from the
+            // manifest = not included, so nothing outside them could pass the
+            // visibleNames net below anyway). A record whose file is missing
+            // from the bundle (manifest/pack drift) is simply skipped —
+            // fail-closed — so no full-tree-walk fallback is needed here.
+            NSFileManager *fm = [NSFileManager defaultManager];
+            NSUInteger missingOnDisk = 0;
+            for (const std::string &relative : capabilityCatalog.visibleRelativePaths)
+            {
+                NSString *relString = [NSString stringWithUTF8String:relative.c_str()];
+                NSString *full = relString != nil ? [presetsRoot stringByAppendingPathComponent:relString] : nil;
+                if (full != nil && [fm fileExistsAtPath:full])
+                {
+                    [treePaths addObject:full];
+                }
+                else
+                {
+                    missingOnDisk++;
+                }
+            }
+            usedHDPathMirror = YES;
+            RoonVisLog(@"ProjectM pack: HD capability catalog resolved %lu paths (%lu missing on disk; skipped full tree walk)",
+                       static_cast<unsigned long>(treePaths.count),
+                       static_cast<unsigned long>(missingOnDisk));
+        }
+        if (hdAllowlistPaths != nil)
+        {
+            NSFileManager *fm = [NSFileManager defaultManager];
+            NSMutableArray<NSString *> *resolved = [NSMutableArray arrayWithCapacity:hdAllowlistPaths.count];
+            BOOL allPresent = YES;
+            for (id rel in hdAllowlistPaths)
+            {
+                if (![rel isKindOfClass:[NSString class]]) { allPresent = NO; break; }
+                NSString *full = [presetsRoot stringByAppendingPathComponent:(NSString *)rel];
+                if (![fm fileExistsAtPath:full]) { allPresent = NO; break; }
+                [resolved addObject:full];
+            }
+            if (allPresent && resolved.count > 0)
+            {
+                [treePaths addObjectsFromArray:resolved];
+                usedHDPathMirror = YES;
+                RoonVisLog(@"ProjectM pack: HD tier used path mirror (%lu presets, skipped full tree walk)",
+                           static_cast<unsigned long>(resolved.count));
+            }
+        }
+        if (!usedHDPathMirror)
+        {
+            NSDirectoryEnumerator<NSString *> *treeEnum = [[NSFileManager defaultManager] enumeratorAtPath:presetsRoot];
+            for (NSString *relative in treeEnum)
+            {
+                if ([relative.pathExtension isEqualToString:@"milk"])
+                {
+                    [treePaths addObject:[presetsRoot stringByAppendingPathComponent:relative]];
+                }
+            }
+        }
+        // Sorted by full path = (category, subcategory, name): Loop mode walks
+        // category order (intentional semantics change from author-cluster order).
+        NSArray<NSString *> *presetPaths = [treePaths sortedArrayUsingSelector:@selector(compare:)];
         _presetPaths.reserve(presetPaths.count);
         NSUInteger slowPresetSkips = 0;
         NSUInteger crashPresetSkips = 0;
@@ -436,7 +657,15 @@ void *ProjectMANGLELoadProc(const char *name, void *)
         for (NSString *path in presetPaths)
         {
             NSString *filename = path.lastPathComponent;
-            if (RoonVisIsKnownSlowPresetFilename(filename))
+            // W2b: a capability-manifest record supersedes the legacy known-slow /
+            // static-heavy verdicts for that filename (measured evidence wins);
+            // no record -> the legacy verdict stands. The known-crash static list
+            // stays a hard block either way.
+            const std::string filenameKey =
+                capabilityMode ? RoonVisNSStringToUTF8(filename) : std::string();
+            const bool manifestHasRecord =
+                capabilityMode && capabilityCatalog.recordNames.count(filenameKey) > 0;
+            if (!manifestHasRecord && RoonVisIsKnownSlowPresetFilename(filename))
             {
                 slowPresetSkips++;
                 continue;
@@ -446,7 +675,7 @@ void *ProjectMANGLELoadProc(const char *name, void *)
                 crashPresetSkips++;
                 continue;
             }
-            if (RoonVisIsStaticHeavyPresetFilename(filename))
+            if (!manifestHasRecord && RoonVisIsStaticHeavyPresetFilename(filename))
             {
                 staticHeavySkips++;
                 continue;
@@ -456,14 +685,35 @@ void *ProjectMANGLELoadProc(const char *name, void *)
                 hiddenPresetSkips++;
                 continue;
             }
+            if (capabilityMode && capabilityCatalog.visibleNames.count(filenameKey) == 0)
+            {
+                // safety != safe, or absent from the manifest (fail-closed: the
+                // manifest covers verified + campaign presets; never-screened
+                // presets keep the pre-manifest "not included" behavior).
+                continue;
+            }
+            if (hdAllowlist != nil && ![hdAllowlist containsObject:filename])
+            {
+                continue;
+            }
             _presetPaths.emplace_back(path.fileSystemRepresentation);
+            // Category metadata from the tree: presets/<Top>/<Sub>/name.milk.
+            NSString *relDir = [[path stringByDeletingLastPathComponent]
+                substringFromIndex:MIN(presetsRoot.length + 1, [path stringByDeletingLastPathComponent].length)];
+            NSArray<NSString *> *dirParts = relDir.pathComponents;
+            _presetCategories.emplace_back(dirParts.count >= 1 && dirParts[0].length > 0
+                                               ? RoonVisNSStringToUTF8(dirParts[0]) : std::string());
+            _presetSubcategories.emplace_back(dirParts.count >= 2
+                                                  ? RoonVisNSStringToUTF8(dirParts[1]) : std::string());
         }
-        // Randomise the rotation order per launch (was a fixed seed, which made every
-        // session open on the same preset and follow the same order). The last-shown
-        // preset is restored explicitly in loadInitialPreset. Loop mode derives its
-        // traversal from the Browse shelves, so this remains Shuffle-only behavior.
-        std::mt19937 rng(arc4random());
-        std::shuffle(_presetPaths.begin(), _presetPaths.end(), rng);
+        // NOTE: the historical per-launch std::shuffle of _presetPaths is REMOVED -
+        // Shuffle mode owns permutation; the stable (category, subcategory, name)
+        // order is what Loop mode and the category metadata rely on.
+#if ROONVIS_ENABLE_DIAGNOSTIC_MODES
+        // Startup breadcrumb for campaign harnesses (W1): thermal state into the
+        // pullable perf-diagnostics sink, once per process.
+        RoonVisEmitThermalStateBreadcrumbOnce();
+#endif
         const std::vector<std::string> fixedRotationFilenames = RoonVisFixedRotationListFilenames();
         if (!fixedRotationFilenames.empty())
         {
@@ -471,10 +721,71 @@ void *ProjectMANGLELoadProc(const char *name, void *)
             RoonVisLog(@"Fixed rotation list: %zu/%zu presets resolved",
                        _fixedRotationIndexes.size(),
                        fixedRotationFilenames.size());
+#if ROONVIS_ENABLE_DIAGNOSTIC_MODES
+            // Mirror the resolve result into the perf-diagnostics file sink: device
+            // campaigns can only pull Library/Caches/perf-diagnostics.log, not NSLog.
+            // The harness verifies requested==its list count and resolved==requested
+            // before burning a session on a mis-set ROONVIS_ROTATION_FIXED_LIST.
+            RoonVisPerfDiagnosticsSinkAppendLine(
+                [NSString stringWithFormat:@"FixedRotation: requested=%zu resolved=%zu",
+                                           fixedRotationFilenames.size(),
+                                           _fixedRotationIndexes.size()]);
+            if (_fixedRotationIndexes.size() < fixedRotationFilenames.size())
+            {
+                // Name the drops (ResolveFixedRotationIndexes discards them silently).
+                // Pipe-joined to match the list's own delimiter; capped so one bad
+                // batch cannot flood the log.
+                const size_t kMaxUnresolvedNames = 20;
+                const std::vector<std::string> unresolved =
+                    RoonVisUnresolvedFixedRotationFilenames(fixedRotationFilenames, _presetPaths);
+                std::string joined;
+                const size_t reportCount = std::min(unresolved.size(), kMaxUnresolvedNames);
+                for (size_t i = 0; i < reportCount; i++)
+                {
+                    if (i > 0)
+                    {
+                        joined += '|';
+                    }
+                    joined += unresolved[i];
+                }
+                RoonVisPerfDiagnosticsSinkAppendLine(
+                    [NSString stringWithFormat:@"FixedRotationUnresolved: %s", joined.c_str()]);
+            }
+#endif
         }
-        _browsePresetOrderIndexes = [self rotationCandidateIndexesForMode:RoonVisPresetRotationModeLoop];
-        [self restoreOrRegenerateShuffleOrder];
-        _lastRotationMode = [RoonVisSettings sharedSettings].presetRotationMode;
+        // One-time migration of the legacy single-shuffle pair into the scoped
+        // store BEFORE the engine loads it (formerly the first step of
+        // restoreOrRegenerateShuffleOrder).
+        [self migrateLegacyShuffleOrderIfNeeded];
+        // Adopt the RotationEngine: seed its catalog + favorites/hidden/slow/
+        // mode/fixed-order/store from current bridge state, then provide a reseed
+        // source so it can regenerate an order whose persisted fingerprint is
+        // stale (restore-or-reseed happens lazily, on the first order query).
+        // ReseedShuffle mirrors regenerateShuffleOrder's arc4random() source.
+        [self seedRotationEngine];
+        if (capabilityMode)
+        {
+            // W2b: the manual-only/warmup set — browse-visible but not yet
+            // rotation-eligible under the all-false W5 readiness stub. A
+            // query-time filter only: seeded orders keep these names, so when
+            // W5/W7a later clears a name it joins rotation WITHOUT a reseed.
+            // Manual picks bypass this by design (selectPresetAtIndex: never
+            // consults the engine's query predicate; fixed-order ditto).
+            const size_t temporarilyUnavailableCount = capabilityCatalog.temporarilyUnavailable.size();
+            _rotationEngine.SetTemporarilyUnavailable(std::move(capabilityCatalog.temporarilyUnavailable));
+            RoonVisLog(@"Capability manifest: catalog=%zu rotation-eligible=%zu temporarily-unavailable=%zu",
+                       _presetPaths.size(),
+                       capabilityCatalog.rotationEligibleCount,
+                       temporarilyUnavailableCount);
+        }
+        _rotationEngine.ReseedShuffle(arc4random());
+        [self drainRotationEngineDirtyScopes];
+        // Router memory for the entering-Shuffle reseed rule (NOT engine state).
+        _lastRotationMode = RoonVisEffectiveRotationMode([RoonVisSettings sharedSettings].presetRotationMode);
+        // A5: establish a defined dwell-plan state after the engine is seeded (packLoaded/
+        // fixed-list). Nothing is confirmed yet so both plans are Idle; the first confirm's
+        // funnel arms them. (Kept explicit so init order is self-documenting.)
+        [self recomputeDwellPlansAtTime:CACurrentMediaTime()];
         RoonVisLog(@"ProjectM hardening: found %zu bundled presets (%lu known slow, %lu known crashing, %lu static-heavy, %lu hidden filtered)",
                    _presetPaths.size(),
                    static_cast<unsigned long>(slowPresetSkips),
@@ -593,29 +904,82 @@ void *ProjectMANGLELoadProc(const char *name, void *)
 
 - (void)settingsDidChange:(NSNotification *)notification
 {
-    [self invalidatePreloadedPresetTracking];
-    // Reseed the Shuffle order only when the user transitions INTO Shuffle, so selecting
-    // Shuffle produces a fresh sequence rather than the launch order (issue #6).
-    RoonVisPresetRotationMode newMode = [RoonVisSettings sharedSettings].presetRotationMode;
-    if (newMode == RoonVisPresetRotationModeShuffle && _lastRotationMode != RoonVisPresetRotationModeShuffle)
-    {
-        [self regenerateShuffleOrder];
-    }
-    _lastRotationMode = newMode;
-    // Rebuild the browse order only for membership/order-affecting keys; a
-    // missing key (programmatic notification) rebuilds as before. Hygiene only:
-    // the rotation cursor no longer depends on this list staying stable.
+    // settingsDidChange is a key -> RotationEngine event router. A5: the former
+    // unconditional invalidatePreloadedPresetTracking is narrowed to exactly the recompute
+    // legs below. Rationale: the dwell plan's event set now covers everything that affects
+    // the next preset OR the settle/lead windows (favorites/hidden -> which next preset;
+    // mode -> which next preset + reseed; rotation interval / transition style / crossfade
+    // -> the settle window and fit). Keys that touch none of that (audioInputDelayMs,
+    // diagnosticsOverlay, warpMeshWidth, frameRateCap, drawableSize, snapcastHost,
+    // audio/beat sensitivity) must NOT invalidate a valid preload — invalidating on them
+    // was pure churn that dropped a good warm for no reason. Each recompute leg sets
+    // needsDwellRecompute; recomputeDwellPlansAtTime: (which invalidates) runs ONCE after
+    // applySettings so the new window values are in place.
+    BOOL needsDwellRecompute = NO;
+
     NSString *changedKey = notification.userInfo[@"key"];
-    const BOOL orderAffecting = changedKey == nil ||
-        [changedKey isEqualToString:RoonVisSettingsHiddenPresetFilenamesKey] ||
-        [changedKey isEqualToString:RoonVisSettingsFavoritePresetFilenamesKey] ||
-        [changedKey isEqualToString:RoonVisSettingsFavoritesOnlyRotationKey] ||
-        [changedKey isEqualToString:RoonVisSettingsPresetRotationModeKey];
-    if (orderAffecting)
+
+    // Favorites key -> SetFavorites. (nil key = programmatic notification: push all.)
+    if (changedKey == nil || [changedKey isEqualToString:RoonVisSettingsFavoritePresetFilenamesKey])
     {
-        _browsePresetOrderIndexes = [self rotationCandidateIndexesForMode:RoonVisPresetRotationModeLoop];
+        [self pushRotationEngineFavorites];
+        needsDwellRecompute = YES; // listsChanged
     }
+    // Hidden key -> SetHidden.
+    if (changedKey == nil || [changedKey isEqualToString:RoonVisSettingsHiddenPresetFilenamesKey])
+    {
+        [self pushRotationEngineHidden];
+        needsDwellRecompute = YES; // listsChanged
+    }
+    // Order/timing keys -> the settle window / fit inputs of the dwell plan changed.
+    if (changedKey == nil ||
+        [changedKey isEqualToString:RoonVisSettingsRotationIntervalSecondsKey] ||
+        [changedKey isEqualToString:RoonVisSettingsTransitionStyleKey] ||
+        [changedKey isEqualToString:RoonVisSettingsCrossfadeDurationSecondsKey])
+    {
+        needsDwellRecompute = YES; // order/timing
+    }
+    // Rotation-mode key (and the favorites-only toggle, a mode change under the
+    // hood) -> SetMode + the EXACT existing reseed rule.
+    if (changedKey == nil ||
+        [changedKey isEqualToString:RoonVisSettingsPresetRotationModeKey] ||
+        [changedKey isEqualToString:RoonVisSettingsFavoritesOnlyRotationKey])
+    {
+        needsDwellRecompute = YES; // modeChanged
+        RoonVisPresetRotationMode newMode =
+            RoonVisEffectiveRotationMode([RoonVisSettings sharedSettings].presetRotationMode);
+        [self pushRotationEngineMode];
+        // Reseed the Shuffle order only when the user transitions INTO Shuffle, so
+        // selecting Shuffle produces a fresh sequence rather than the launch order
+        // (issue #6). EXCEPT when returning from Category mode: a Category detour must
+        // never touch the global Shuffle entry (scoped-store non-clobber contract), so
+        // Shuffle resumes the persisted sequence exactly where it left off.
+        // _lastRotationMode is the router's memory of the previous mode; it survives
+        // the A4b deletions because the engine has no "previous mode" concept.
+        if (newMode == RoonVisPresetRotationModeShuffle &&
+            _lastRotationMode != RoonVisPresetRotationModeShuffle &&
+            _lastRotationMode != RoonVisPresetRotationModeCategory)
+        {
+            // ForceReshuffle == legacy regenerateShuffleOrder: a FRESH sequence
+            // even when a fingerprint-valid persisted order exists (plain
+            // ReseedShuffle would restore it — launch semantics, not this).
+            _rotationEngine.ForceReshuffle(arc4random());
+            (void)_rotationEngine.FullOrder(); // materialize + mark "" dirty
+        }
+        _lastRotationMode = newMode;
+    }
+
+    // R3: drain after the full event batch (a reseed above dirties scope "";
+    // no-op otherwise). Anchor state is untouched by settings keys (R2).
+    [self drainRotationEngineDirtyScopes];
     [self applySettings];
+    // A5: recompute the dwell plans AFTER applySettings so the new rotation interval /
+    // crossfade / transition style are already in the ivars the plan reads. This also
+    // invalidates the preloaded-preset tracking (only on the recompute legs).
+    if (needsDwellRecompute)
+    {
+        [self recomputeDwellPlansAtTime:CACurrentMediaTime()];
+    }
 }
 
 - (void)applySettings
@@ -634,11 +998,23 @@ void *ProjectMANGLELoadProc(const char *name, void *)
     // Burn-in dwell override (dev/QA): rotation interval in seconds, below the
     // settings floor if needed (e.g. 30 s full-pack passes). Loop coverage comes
     // from ROONVIS_ROTATION_FIXED_LIST; this only shortens the dwell.
+    BOOL burninDwellOverridden = NO;
     {
         NSString *burninDwell = NSProcessInfo.processInfo.environment[@"ROONVIS_ROTATION_SECONDS"];
         if (burninDwell.length > 0 && burninDwell.doubleValue > 0.0)
         {
             presetDuration = burninDwell.doubleValue;
+            burninDwellOverridden = YES;
+        }
+    }
+    // Crossfade override (dev/QA): forces the soft-cut duration, 0 allowed
+    // (instant cuts — no dual-render — for screening campaigns); 2-5 s for
+    // transition-cost studies. Below/above the settings clamp by design.
+    {
+        NSString *xfade = NSProcessInfo.processInfo.environment[@"ROONVIS_CROSSFADE_SECONDS"];
+        if (xfade.length > 0 && xfade.doubleValue >= 0.0)
+        {
+            softCutDuration = xfade.doubleValue;
         }
     }
 #endif
@@ -656,6 +1032,17 @@ void *ProjectMANGLELoadProc(const char *name, void *)
     _transitionStyle = settings.transitionStyle;
     _audioSensitivity = settings.audioSensitivity;
     _rotationIntervalSeconds = settings.rotationIntervalSeconds;
+#if ROONVIS_ENABLE_DIAGNOSTIC_MODES
+    // The dwell override must ALSO reach the app-owned rotation scheduler: dwell
+    // plans and rotation advance consume _rotationIntervalSeconds, not projectM's
+    // preset duration, so overriding only presetDuration leaves campaigns rotating
+    // at the settings default (the "ROONVIS_ROTATION_SECONDS ignored" bug, re-hit
+    // by W2 batch 1 which ran 60 s dwells against a requested 30 s).
+    if (burninDwellOverridden)
+    {
+        _rotationIntervalSeconds = presetDuration;
+    }
+#endif
     _crossfadeDurationSeconds = settings.crossfadeDurationSeconds;
     // Live frame-rate cap changes: keep projectM's fps hint in step with the
     // (capped) display-link rate applied by ANGLEGLView's settings observer.
@@ -734,17 +1121,11 @@ void *ProjectMANGLELoadProc(const char *name, void *)
 
 - (BOOL)isPresetHiddenOrSlow:(NSString *)presetName
 {
-    if (presetName.length == 0)
-    {
-        return YES;
-    }
-    if ([[RoonVisSettings sharedSettings] isHiddenPresetFilename:presetName])
-    {
-        return YES;
-    }
-
-    const char *presetFileSystemName = presetName.fileSystemRepresentation;
-    return presetFileSystemName != nullptr && _slowPresetNames.find(presetFileSystemName) != _slowPresetNames.end();
+    // A4b: the engine owns exclusion (hidden ∪ slow; empty name excluded). Its
+    // sets stay synced by the settingsDidChange router (hidden) and
+    // pushRotationEngineSlow (slow), both of which fire synchronously on the
+    // main/GL thread before any caller can observe stale state.
+    return _rotationEngine.IsExcludedName(RoonVisNSStringToUTF8(presetName)) ? YES : NO;
 }
 
 - (std::vector<RoonVis::PresetShelfInput>)presetShelfInputsFavoritesOnly:(BOOL)favoritesOnly
@@ -773,177 +1154,356 @@ void *ProjectMANGLELoadProc(const char *name, void *)
         input.filename = RoonVisNSStringToUTF8(filename);
         input.title = RoonVisNSStringToUTF8(RoonVisHumanPresetTitle([self presetDisplayNameAtIndex:index], index));
         input.favorite = favorite;
+        if (index < _presetCategories.size())
+        {
+            input.category = _presetCategories[index];
+            input.subcategory = _presetSubcategories[index];
+        }
         inputs.push_back(input);
     }
     return inputs;
 }
 
-static NSString *const kShuffleOrderFilenamesKey = @"RoonVisShuffleOrderFilenames";
-static NSString *const kShuffleOrderFingerprintKey = @"RoonVisShuffleOrderFingerprint";
-
-- (std::string)shuffleOrderFingerprint
+// Scoped rotation-order store: {scope -> {filenames, fingerprint}}. Scope "" is
+// the global Shuffle order (migrated once from the legacy pair below); scope
+// "<CategoryName>" is that category's order (Category rotation mode). Writes go
+// through RoonVis::UpsertScopedRotationOrder, whose host-tested contract is that
+// writing one scope never touches another - entering/leaving Category mode can
+// never clobber the global Shuffle sequence.
+static NSString *const kScopedRotationOrdersKey = @"RoonVisScopedRotationOrders";
+static NSString *const kScopedRotationOrderFilenamesField = @"filenames";
+static NSString *const kScopedRotationOrderFingerprintField = @"fingerprint";
+static NSString *const kGlobalShuffleScope = @"";
+// The scoped store lives in a Caches plist, NOT NSUserDefaults: tvOS
+// SIGKILLs any app whose preferences exceed ~1MB, and one CotC-scale order is
+// ~550KB of filenames (7.7k names) - the global scope plus a couple of
+// category scopes crossed the limit and the app was killed at launch on the
+// very write that persisted them. Caches because tvOS apps may only write to
+// Caches and tmp (a Documents write fails on device); the system purging the
+// file only costs a reseed.
+static NSString *RoonVisScopedRotationOrdersFilePath(void)
 {
-    std::vector<std::string> pack;
-    pack.reserve(_presetPaths.size());
-    for (size_t index = 0; index < _presetPaths.size(); index++)
+    NSArray<NSString *> *caches = NSSearchPathForDirectoriesInDomains(NSCachesDirectory, NSUserDomainMask, YES);
+    if (caches.count == 0)
     {
-        pack.push_back(RoonVisNSStringToUTF8([self presetDisplayNameForPath:_presetPaths[index]]));
+        return nil;
     }
-    const std::set<std::string> &confirmed = _learnedSlowStore.ConfirmedNames();
-    std::vector<std::string> slow(confirmed.begin(), confirmed.end());
-    return RoonVis::ShuffleOrderFingerprint(pack, slow);
+    return [caches.firstObject stringByAppendingPathComponent:@"ScopedRotationOrders.plist"];
+}
+// Legacy single-shuffle keys, superseded by the scoped store.
+static NSString *const kLegacyShuffleOrderFilenamesKey = @"RoonVisShuffleOrderFilenames";
+static NSString *const kLegacyShuffleOrderFingerprintKey = @"RoonVisShuffleOrderFingerprint";
+
+// A4b: fingerprint computation moved into RotationEngine (FingerprintForScope,
+// fed by SetLearnedSlowConfirmed — the confirmed set only, per R1). The methods
+// below are the thin plist load/drain adapters the engine persists through
+// (byte-identical serialization, host-tested UpsertScopedRotationOrder merge).
+
+- (void)writeScopedRotationOrdersFile:(NSDictionary *)serialized
+{
+    NSString *path = RoonVisScopedRotationOrdersFilePath();
+    if (path == nil)
+    {
+        return;
+    }
+    NSData *data = [NSPropertyListSerialization dataWithPropertyList:serialized
+                                                              format:NSPropertyListBinaryFormat_v1_0
+                                                             options:0
+                                                               error:NULL];
+    if (data == nil || ![data writeToFile:path atomically:YES])
+    {
+        RoonVisLog(@"ProjectM rotation: FAILED to write scoped order store (%lu scopes)",
+                   static_cast<unsigned long>(serialized.count));
+    }
 }
 
-- (void)persistShuffleOrder
+- (NSDictionary *)scopedRotationOrders
 {
-    NSMutableArray<NSString *> *filenames = [NSMutableArray arrayWithCapacity:_shuffleOrderIndexes.size()];
-    for (size_t index : _shuffleOrderIndexes)
+    NSString *path = RoonVisScopedRotationOrdersFilePath();
+    NSData *data = path != nil ? [NSData dataWithContentsOfFile:path] : nil;
+    id store = data != nil
+        ? [NSPropertyListSerialization propertyListWithData:data
+                                                    options:NSPropertyListImmutable
+                                                     format:NULL
+                                                      error:NULL]
+        : nil;
+    // One-shot rescue of the store from NSUserDefaults (where it originally
+    // lived and could grow past the tvOS ~1MB kill threshold): adopt it into
+    // the file if the file has nothing, and remove the oversized key either
+    // way so the preferences plist shrinks back under the limit.
+    NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+    NSDictionary *defaultsStore = [defaults dictionaryForKey:kScopedRotationOrdersKey];
+    if (defaultsStore != nil)
     {
-        if (index < _presetPaths.size())
+        if (![store isKindOfClass:NSDictionary.class] || [store count] == 0)
         {
-            [filenames addObject:[self presetDisplayNameForPath:_presetPaths[index]]];
+            store = defaultsStore;
+            [self writeScopedRotationOrdersFile:defaultsStore];
         }
+        [defaults removeObjectForKey:kScopedRotationOrdersKey];
+        RoonVisLog(@"ProjectM rotation: moved scoped order store out of NSUserDefaults (%lu scopes)",
+                   static_cast<unsigned long>(defaultsStore.count));
     }
-    NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
-    [defaults setObject:filenames forKey:kShuffleOrderFilenamesKey];
-    [defaults setObject:[NSString stringWithUTF8String:[self shuffleOrderFingerprint].c_str()]
-                 forKey:kShuffleOrderFingerprintKey];
+    return [store isKindOfClass:NSDictionary.class] ? store : @{};
 }
 
-// Restores the persisted shuffle permutation when its fingerprint (pack filename
-// set + learned-slow confirmed set) still matches; otherwise reseeds. Entries
-// hidden or runtime-slow-marked are RETAINED in the order and filtered by the
-// advance predicate, so short sessions continue the walk across launches
-// instead of resampling the head of a fresh permutation every time.
-- (void)restoreOrRegenerateShuffleOrder
+// The validated {filenames, fingerprint} entry for `scope`, or nil when absent
+// or malformed.
+- (nullable NSDictionary *)scopedRotationOrderEntryForScope:(NSString *)scope
 {
-    NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
-    NSString *storedFingerprint = [defaults stringForKey:kShuffleOrderFingerprintKey];
-    NSArray *storedOrder = [defaults arrayForKey:kShuffleOrderFilenamesKey];
-    if (storedFingerprint.length > 0 && [storedOrder isKindOfClass:NSArray.class] && storedOrder.count > 0 &&
-        [self shuffleOrderFingerprint] == RoonVisNSStringToUTF8(storedFingerprint))
+    NSDictionary *entry = [self scopedRotationOrders][scope];
+    if (![entry isKindOfClass:NSDictionary.class])
     {
-        std::vector<std::string> stored;
-        stored.reserve(storedOrder.count);
-        for (id item in storedOrder)
+        return nil;
+    }
+    NSArray *filenames = entry[kScopedRotationOrderFilenamesField];
+    NSString *fingerprint = entry[kScopedRotationOrderFingerprintField];
+    if (![filenames isKindOfClass:NSArray.class] || filenames.count == 0 ||
+        ![fingerprint isKindOfClass:NSString.class] || fingerprint.length == 0)
+    {
+        return nil;
+    }
+    return entry;
+}
+
+- (void)persistScopedRotationOrderFilenames:(NSArray<NSString *> *)filenames
+                                fingerprint:(NSString *)fingerprint
+                                   forScope:(NSString *)scope
+{
+    // Round-trip through the pure C++ store so the merge semantics (write one
+    // scope, preserve every other verbatim) are the host-tested ones.
+    RoonVis::ScopedRotationOrderStore store;
+    NSDictionary *existing = [self scopedRotationOrders];
+    for (NSString *existingScope in existing)
+    {
+        if (![existingScope isKindOfClass:NSString.class])
+        {
+            continue;
+        }
+        NSDictionary *entry = existing[existingScope];
+        if (![entry isKindOfClass:NSDictionary.class])
+        {
+            continue;
+        }
+        NSArray *entryFilenames = entry[kScopedRotationOrderFilenamesField];
+        NSString *entryFingerprint = entry[kScopedRotationOrderFingerprintField];
+        if (![entryFilenames isKindOfClass:NSArray.class] || ![entryFingerprint isKindOfClass:NSString.class])
+        {
+            continue;
+        }
+        RoonVis::ScopedRotationOrder order;
+        order.filenames.reserve(entryFilenames.count);
+        for (id item in entryFilenames)
         {
             if ([item isKindOfClass:NSString.class])
             {
-                stored.push_back(RoonVisNSStringToUTF8(static_cast<NSString *>(item)));
+                order.filenames.push_back(RoonVisNSStringToUTF8(static_cast<NSString *>(item)));
             }
         }
-        std::vector<size_t> restored = RoonVis::RestoreShuffleOrder(stored, [self](const std::string &filename) {
-            NSString *name = [NSString stringWithUTF8String:filename.c_str()];
-            for (size_t index = 0; index < self->_presetPaths.size(); index++)
-            {
-                if ([[self presetDisplayNameForPath:self->_presetPaths[index]] isEqualToString:name])
-                {
-                    return index;
-                }
-            }
-            return static_cast<size_t>(SIZE_MAX);
-        });
-        if (!restored.empty())
-        {
-            _shuffleOrderIndexes = std::move(restored);
-            RoonVisLog(@"ProjectM rotation: restored persisted shuffle order (%zu entries)", _shuffleOrderIndexes.size());
-            return;
-        }
+        order.fingerprint = RoonVisNSStringToUTF8(entryFingerprint);
+        store[RoonVisNSStringToUTF8(existingScope)] = std::move(order);
     }
-    [self regenerateShuffleOrder];
+
+    RoonVis::ScopedRotationOrder entry;
+    entry.filenames.reserve(filenames.count);
+    for (NSString *filename in filenames)
+    {
+        entry.filenames.push_back(RoonVisNSStringToUTF8(filename));
+    }
+    entry.fingerprint = RoonVisNSStringToUTF8(fingerprint);
+    store = RoonVis::UpsertScopedRotationOrder(store, RoonVisNSStringToUTF8(scope), entry);
+
+    NSMutableDictionary *serialized = [NSMutableDictionary dictionaryWithCapacity:store.size()];
+    for (const auto &pair : store)
+    {
+        NSMutableArray<NSString *> *entryFilenames = [NSMutableArray arrayWithCapacity:pair.second.filenames.size()];
+        for (const std::string &filename : pair.second.filenames)
+        {
+            [entryFilenames addObject:[NSString stringWithUTF8String:filename.c_str()]];
+        }
+        serialized[[NSString stringWithUTF8String:pair.first.c_str()]] = @{
+            kScopedRotationOrderFilenamesField : entryFilenames,
+            kScopedRotationOrderFingerprintField : [NSString stringWithUTF8String:pair.second.fingerprint.c_str()],
+        };
+    }
+    [self writeScopedRotationOrdersFile:serialized];
 }
 
-- (void)regenerateShuffleOrder
+// One-time migration of the legacy single-shuffle pair into scope "" of the
+// scoped store. The legacy keys are removed either way; an existing scope ""
+// entry is never overwritten.
+- (void)migrateLegacyShuffleOrderIfNeeded
 {
-    std::vector<size_t> visible;
-    visible.reserve(_presetPaths.size());
+    NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+    NSArray *legacyOrder = [defaults arrayForKey:kLegacyShuffleOrderFilenamesKey];
+    NSString *legacyFingerprint = [defaults stringForKey:kLegacyShuffleOrderFingerprintKey];
+    if (legacyOrder == nil && legacyFingerprint == nil)
+    {
+        return;
+    }
+    if ([self scopedRotationOrderEntryForScope:kGlobalShuffleScope] == nil &&
+        [legacyOrder isKindOfClass:NSArray.class] && legacyOrder.count > 0 && legacyFingerprint.length > 0)
+    {
+        [self persistScopedRotationOrderFilenames:legacyOrder
+                                      fingerprint:legacyFingerprint
+                                         forScope:kGlobalShuffleScope];
+        RoonVisLog(@"ProjectM rotation: migrated legacy shuffle order (%lu entries) into scoped store",
+                   static_cast<unsigned long>(legacyOrder.count));
+    }
+    [defaults removeObjectForKey:kLegacyShuffleOrderFilenamesKey];
+    [defaults removeObjectForKey:kLegacyShuffleOrderFingerprintKey];
+}
+
+// --- RotationEngine adoption plumbing -----------------------------------------
+// A4b: the legacy restore/persist/reseed helpers (restoredScopedOrderForScope,
+// persistShuffleOrder, restoreOrRegenerateShuffleOrder, regenerateShuffleOrder,
+// rotationAnchorCategoryName, categoryRotationOrderForCategory) are deleted —
+// RotationEngine owns restore-or-reseed, fingerprints, and the Category scope.
+// What remains bridge-side is the plist file adapter (scopedRotationOrders /
+// persistScopedRotationOrderFilenames, byte-identical serialization) plus the
+// event pushers and the dirty-scope drain below.
+
+// Convert an NSSet<NSString*> of preset filenames to a display-name key set,
+// matching the engine catalog keys (path.lastPathComponent == filename here).
+static std::unordered_set<std::string> RoonVisFilenameSetToUnordered(NSSet<NSString *> *names)
+{
+    std::unordered_set<std::string> result;
+    result.reserve(names.count);
+    for (NSString *name in names)
+    {
+        if ([name isKindOfClass:NSString.class] && name.length > 0)
+        {
+            result.insert(RoonVisNSStringToUTF8(name));
+        }
+    }
+    return result;
+}
+
+- (void)pushRotationEngineFavorites
+{
+    _rotationEngine.SetFavorites(RoonVisFilenameSetToUnordered([RoonVisSettings sharedSettings].favoritePresetFilenames));
+}
+
+- (void)pushRotationEngineHidden
+{
+    _rotationEngine.SetHidden(RoonVisFilenameSetToUnordered([RoonVisSettings sharedSettings].hiddenPresetFilenames));
+}
+
+- (void)pushRotationEngineSlow
+{
+    // Exclusion set: session-slow ∪ learned-slow-confirmed (mirrors _slowPresetNames,
+    // which loadLearnedSlowPresets seeds with the confirmed set and markPresetNameSlow
+    // grows at runtime). Fingerprint input: the learned-slow CONFIRMED set ONLY.
+    std::unordered_set<std::string> exclusion(_slowPresetNames.begin(), _slowPresetNames.end());
+    _rotationEngine.SetSlowNames(std::move(exclusion));
+    const std::set<std::string> &confirmed = _learnedSlowStore.ConfirmedNames();
+    _rotationEngine.SetLearnedSlowConfirmed(std::unordered_set<std::string>(confirmed.begin(), confirmed.end()));
+}
+
+- (void)pushRotationEngineMode
+{
+    RoonVisPresetRotationMode mode =
+        RoonVisEffectiveRotationMode([RoonVisSettings sharedSettings].presetRotationMode);
+    _rotationEngine.SetMode(RoonVisEngineRotationMode(mode));
+}
+
+- (void)updateRotationEngineAnchor
+{
+    // Confirmed = on-screen preset; requested = the in-flight target (the bridge's
+    // rotationAnchorIndex when a load is mid-flight, else the confirmed index).
+    _rotationEngine.SetAnchor(_confirmedPresetIndex, [self rotationAnchorIndex]);
+}
+
+- (void)drainRotationEngineDirtyScopes
+{
+    std::string scope;
+    RoonVis::ScopedRotationOrder entry;
+    while (_rotationEngine.TakeDirtyScope(scope, entry))
+    {
+        NSString *scopeStr = [NSString stringWithUTF8String:scope.c_str()] ?: @"";
+        NSMutableArray<NSString *> *filenames = [NSMutableArray arrayWithCapacity:entry.filenames.size()];
+        for (const std::string &filename : entry.filenames)
+        {
+            NSString *value = [NSString stringWithUTF8String:filename.c_str()];
+            if (value != nil)
+            {
+                [filenames addObject:value];
+            }
+        }
+        NSString *fingerprint = [NSString stringWithUTF8String:entry.fingerprint.c_str()] ?: @"";
+        [self persistScopedRotationOrderFilenames:filenames fingerprint:fingerprint forScope:scopeStr];
+    }
+}
+
+- (void)seedRotationEngine
+{
+    // Catalog: display name (path.lastPathComponent), human title, top/sub category
+    // from the parallel vectors. favorite=false always (R5: favorites are a runtime
+    // set fed via SetFavorites, never baked into the fixed catalog).
+    std::vector<RoonVis::RotationCatalogEntry> catalog;
+    catalog.reserve(_presetPaths.size());
     for (size_t index = 0; index < _presetPaths.size(); index++)
     {
-        NSString *presetName = [self presetDisplayNameForPath:_presetPaths[index]];
-        if (![self isPresetHiddenOrSlow:presetName])
+        RoonVis::RotationCatalogEntry entry;
+        entry.filename = RoonVisNSStringToUTF8([self presetDisplayNameForPath:_presetPaths[index]]);
+        entry.title = RoonVisNSStringToUTF8(RoonVisHumanPresetTitle([self presetDisplayNameAtIndex:index], index));
+        if (index < _presetCategories.size())
         {
-            visible.push_back(index);
+            entry.category = _presetCategories[index];
         }
-    }
-    _shuffleOrderIndexes = RoonVis::ShuffledOrder(visible, arc4random());
-    [self persistShuffleOrder];
-    RoonVisLog(@"ProjectM settings: shuffle order reseeded (%zu presets)", _shuffleOrderIndexes.size());
-}
-
-- (std::vector<size_t>)rotationCandidateIndexesForMode:(RoonVisPresetRotationMode)mode
-{
-    if (_presetPaths.empty())
-    {
-        return {};
-    }
-
-    if (mode == RoonVisPresetRotationModeShuffle)
-    {
-        if (_shuffleOrderIndexes.empty())
+        if (index < _presetSubcategories.size())
         {
-            [self regenerateShuffleOrder];
+            entry.subcategory = _presetSubcategories[index];
         }
-        // Return the reseeded shuffle order, re-filtered in case hidden/slow presets
-        // changed since it was generated.
-        std::vector<size_t> indexes;
-        indexes.reserve(_shuffleOrderIndexes.size());
-        for (size_t index : _shuffleOrderIndexes)
+        entry.favorite = false;
+        catalog.push_back(std::move(entry));
+    }
+    _rotationEngine.SetCatalog(std::move(catalog));
+
+    // Favorites / hidden / slow(+confirmed) / mode.
+    [self pushRotationEngineFavorites];
+    [self pushRotationEngineHidden];
+    [self pushRotationEngineSlow];
+    [self pushRotationEngineMode];
+
+    // Fixed-order debug hook (parsed ObjC-side into _fixedRotationIndexes above).
+    _rotationEngine.SetFixedOrder(_fixedRotationIndexes);
+
+    // Load the persisted scoped-order store (the whole store, not per-scope) so the
+    // engine can restore-or-reseed each scope on demand.
+    RoonVis::ScopedRotationOrderStore store;
+    NSDictionary *existing = [self scopedRotationOrders];
+    for (NSString *existingScope in existing)
+    {
+        if (![existingScope isKindOfClass:NSString.class])
         {
-            if (index >= _presetPaths.size())
+            continue;
+        }
+        NSDictionary *entry = existing[existingScope];
+        if (![entry isKindOfClass:NSDictionary.class])
+        {
+            continue;
+        }
+        NSArray *entryFilenames = entry[kScopedRotationOrderFilenamesField];
+        NSString *entryFingerprint = entry[kScopedRotationOrderFingerprintField];
+        if (![entryFilenames isKindOfClass:NSArray.class] || ![entryFingerprint isKindOfClass:NSString.class])
+        {
+            continue;
+        }
+        RoonVis::ScopedRotationOrder order;
+        order.filenames.reserve(entryFilenames.count);
+        for (id item in entryFilenames)
+        {
+            if ([item isKindOfClass:NSString.class])
             {
-                continue;
-            }
-            NSString *presetName = [self presetDisplayNameForPath:_presetPaths[index]];
-            if (![self isPresetHiddenOrSlow:presetName])
-            {
-                indexes.push_back(index);
+                order.filenames.push_back(RoonVisNSStringToUTF8(static_cast<NSString *>(item)));
             }
         }
-        return indexes;
+        order.fingerprint = RoonVisNSStringToUTF8(entryFingerprint);
+        store[RoonVisNSStringToUTF8(existingScope)] = std::move(order);
     }
-
-    std::vector<RoonVis::PresetShelfInput> inputs = [self presetShelfInputsFavoritesOnly:(mode == RoonVisPresetRotationModeFavorites)];
-    std::vector<RoonVis::PresetShelf> shelves = RoonVis::BuildPresetShelves(inputs, mode == RoonVisPresetRotationModeFavorites, 3);
-    std::vector<size_t> indexes = RoonVis::FlattenPresetShelfIndexes(shelves);
-    if (mode == RoonVisPresetRotationModeFavorites && indexes.empty())
-    {
-        RoonVisLog(@"ProjectM settings: favourites rotation requested but no favourites exist; using Loop rotation");
-        inputs = [self presetShelfInputsFavoritesOnly:NO];
-        shelves = RoonVis::BuildPresetShelves(inputs, false, 3);
-        indexes = RoonVis::FlattenPresetShelfIndexes(shelves);
-    }
-    return indexes;
-}
-
-- (std::vector<size_t>)fullRotationOrderForMode:(RoonVisPresetRotationMode)mode
-{
-    if (_presetPaths.empty())
-    {
-        return {};
-    }
-
-    if (mode == RoonVisPresetRotationModeShuffle)
-    {
-        if (_shuffleOrderIndexes.empty())
-        {
-            [self regenerateShuffleOrder];
-        }
-        // The raw permutation, unfiltered: entries hidden or slow-marked since
-        // the seed stay in place and are skipped by the advance predicate.
-        return _shuffleOrderIndexes;
-    }
-
-    std::vector<RoonVis::PresetShelfInput> inputs = [self presetShelfInputsFavoritesOnly:(mode == RoonVisPresetRotationModeFavorites) includeHidden:YES];
-    std::vector<RoonVis::PresetShelf> shelves = RoonVis::BuildPresetShelves(inputs, mode == RoonVisPresetRotationModeFavorites, 3);
-    std::vector<size_t> indexes = RoonVis::FlattenPresetShelfIndexes(shelves);
-    if (mode == RoonVisPresetRotationModeFavorites && indexes.empty())
-    {
-        RoonVisLog(@"ProjectM settings: favourites rotation requested but no favourites exist; using Loop rotation");
-        inputs = [self presetShelfInputsFavoritesOnly:NO includeHidden:YES];
-        shelves = RoonVis::BuildPresetShelves(inputs, false, 3);
-        indexes = RoonVis::FlattenPresetShelfIndexes(shelves);
-    }
-    return indexes;
+    _rotationEngine.LoadScopedOrders(std::move(store));
+    // LoadScopedOrders is a restore, not a reseed: it must not dirty. No drain here.
 }
 
 - (size_t)rotationAnchorIndex
@@ -965,42 +1525,18 @@ static NSString *const kShuffleOrderFingerprintKey = @"RoonVisShuffleOrderFinger
         return SIZE_MAX;
     }
 
-    RoonVisSettings *settings = [RoonVisSettings sharedSettings];
-    RoonVisPresetRotationMode mode = settings.presetRotationMode;
-    // Debug determinism hook: a fixed list overrides mode and skips the hidden/slow
-    // filter (listed presets rotate regardless; always empty in Release).
-    std::vector<size_t> order = _fixedRotationIndexes;
-    std::function<bool(size_t)> excluded;
-    if (!order.empty())
-    {
-        excluded = [self](size_t candidateIndex) {
-            return candidateIndex >= self->_presetPaths.size();
-        };
-    }
-    else
-    {
-        // The FULL mode order (hidden/slow entries retained) + an exclusion
-        // predicate. The cursor continues from the anchor's order position even
-        // when the anchor itself was just hidden or slow-marked; the historical
-        // filtered-list search reset to the front in that case, looping the head
-        // of the pack and starving the tail.
-        order = [self fullRotationOrderForMode:mode];
-        excluded = [self](size_t candidateIndex) {
-            if (candidateIndex >= self->_presetPaths.size())
-            {
-                return true;
-            }
-            NSString *presetName = [self presetDisplayNameForPath:self->_presetPaths[candidateIndex]];
-            return static_cast<bool>([self isPresetHiddenOrSlow:presetName]);
-        };
-    }
-    if (order.empty())
-    {
-        return SIZE_MAX;
-    }
-
-    RoonVis::RotationAdvanceResult advance = RoonVis::AdvanceRotationCursor(order, index, offset, excluded);
-    return advance.valid ? advance.index : SIZE_MAX;
+    // A4b: the engine owns selection for ALL modes. Its NextFrom handles the fixed
+    // list (mode override + bounds-only exclusion), the shuffle/loop/favorites/
+    // category full order, and the hidden/slow exclusion predicate identically to
+    // the former legacy walk (FULL order retained so the cursor's anchor stays
+    // findable after an exclusion; exclusion is a predicate at advance time). The
+    // Category order is anchor-driven, so sync the engine anchor from the current
+    // confirmed/requested indexes BEFORE the query (R2: anchor batched before any
+    // drain). A shuffle/category query may reseed, so drain afterward (R3).
+    [self updateRotationEngineAnchor];
+    size_t next = _rotationEngine.NextFrom(index, offset);
+    [self drainRotationEngineDirtyScopes];
+    return next;
 }
 
 - (void)dealloc
@@ -1022,17 +1558,65 @@ static NSString *const kShuffleOrderFingerprintKey = @"RoonVisShuffleOrderFinger
 - (void)resizeToDrawableSize:(CGSize)drawableSize
 {
     self.drawableSize = drawableSize;
-    RoonVisLog(@"ProjectM resize: drawable %.0fx%.0f", drawableSize.width, drawableSize.height);
     if (self.projectM == nullptr)
     {
+        RoonVisLog(@"ProjectM resize: drawable %.0fx%.0f", drawableSize.width, drawableSize.height);
         return;
     }
 
     size_t width = static_cast<size_t>(std::max<CGFloat>(1, drawableSize.width));
     size_t height = static_cast<size_t>(std::max<CGFloat>(1, drawableSize.height));
-    projectm_set_fps(self.projectM, RoonVisEffectiveProjectMFPS());
-    [self invalidatePreloadedPresetTracking];
+    // W0 same-size guard: re-applying an unchanged size (layout passes, settings
+    // notifications) must not drop a valid preset preload — the dwell recompute below
+    // invalidates preload tracking — nor re-run projectm_set_window_size. A genuine EGL
+    // surface recreation at the SAME size still invalidates the preload slot; that path
+    // calls -noteEGLSurfaceRecreated, which forces the recompute this guard skips.
+    if (width == _appliedProjectMWindowWidth && height == _appliedProjectMWindowHeight)
+    {
+        RoonVisLog(@"Drawable config skipped: size unchanged (%zux%zu)", width, height);
+        return;
+    }
+    RoonVisLog(@"ProjectM resize: drawable %.0fx%.0f", drawableSize.width, drawableSize.height);
+    // A5: a resize drops the compiled preload slot (surface recreated). Recompute the dwell
+    // plans (which invalidates the preload tracking) so a plan left Satisfied by an earlier
+    // warm re-arms and re-warms against the new surface instead of thinking it is done.
+    // (fps hint is decoupled: see -refreshProjectMFPSHint.)
+    [self recomputeDwellPlansAtTime:CACurrentMediaTime()];
     projectm_set_window_size(self.projectM, width, height);
+    _appliedProjectMWindowWidth = width;
+    _appliedProjectMWindowHeight = height;
+}
+
+- (NSUInteger)transpileCacheHits
+{
+    return static_cast<NSUInteger>(_preprocessCache.Hits());
+}
+
+- (NSUInteger)transpileCacheMisses
+{
+    return static_cast<NSUInteger>(_preprocessCache.Misses());
+}
+
+- (void)refreshProjectMFPSHint
+{
+    if (self.projectM == nullptr)
+    {
+        return;
+    }
+    projectm_set_fps(self.projectM, RoonVisEffectiveProjectMFPS());
+}
+
+- (void)noteEGLSurfaceRecreated
+{
+    if (self.projectM == nullptr)
+    {
+        return;
+    }
+    // A recreated surface invalidates the compiled preload slot even when the drawable
+    // size is unchanged (so -resizeToDrawableSize:'s guard will skip). Re-arm the dwell
+    // plans so a Satisfied plan re-warms against the new surface. This also covers the
+    // swap-failure recovery recreate, which never went through resize at all.
+    [self recomputeDwellPlansAtTime:CACurrentMediaTime()];
 }
 
 @end

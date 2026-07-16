@@ -10,6 +10,13 @@ NS_ASSUME_NONNULL_BEGIN
 @property(nonatomic, assign, readonly) double diagnosticsFPS;
 @property(nonatomic, assign, readonly) double diagnosticsFrameTimeMs;
 
+// Live HUD metrics (0.5s-poll resolution, independent of the 5s diagnostics
+// window): -hudCurrentFPS samples-and-resets frames since the previous call;
+// droppedFramesSincePresetChange counts late (>1.5x target interval) or
+// skipped frames and resets whenever the confirmed preset changes.
+- (double)hudCurrentFPS;
+@property(nonatomic, assign, readonly) NSUInteger droppedFramesSincePresetChange;
+
 - (void)pause;
 - (void)resume;
 - (void)reconnectSnapcastNow;

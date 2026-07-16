@@ -49,99 +49,6 @@ index 9a42545ac..7e95a10e3 100644
  /**
   * @brief Loads a preset from the data pointer.
   *
-diff --git a/src/api/include/projectM-4/preprocess_cache.h b/src/api/include/projectM-4/preprocess_cache.h
-new file mode 100644
-index 000000000..73ee61451
---- /dev/null
-+++ b/src/api/include/projectM-4/preprocess_cache.h
-@@ -0,0 +1,87 @@
-+/**
-+ * @file preprocess_cache.h
-+ * @copyright 2003-2026 projectM Team
-+ * @brief Optional application-provided cache for preprocessed Milkdrop preset shaders.
-+ * @since 4.2.0
-+ *
-+ * projectM -- Milkdrop-esque visualisation SDK
-+ * Copyright (C)2003-2024 projectM Team
-+ *
-+ * This library is free software; you can redistribute it and/or
-+ * modify it under the terms of the GNU Lesser General Public
-+ * License as published by the Free Software Foundation; either
-+ * version 2.1 of the License, or (at your option) any later version.
-+ *
-+ * This library is distributed in the hope that it will be useful,
-+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
-+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
-+ * Lesser General Public License for more details.
-+ *
-+ * You should have received a copy of the GNU Lesser General Public
-+ * License along with this library; if not, write to the Free Software
-+ * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
-+ * See 'LICENSE.txt' included within this release
-+ *
-+ */
-+
-+#pragma once
-+
-+#include "projectM-4/types.h"
-+
-+#include <stddef.h>
-+
-+#ifdef __cplusplus
-+extern "C" {
-+#endif
-+
-+/**
-+ * @brief Optional hooks for caching the preprocessed-HLSL text of Milkdrop preset shaders.
-+ *
-+ * The Milkdrop shader transpiler runs a text preprocessor (macro expansion) over each
-+ * preset shader before parsing it. That step is pure text and deterministic for a given
-+ * input, so its result can be cached across runs. When these hooks are registered, projectM
-+ * computes a stable key for the preprocessor input and consults the cache before running the
-+ * (comparatively expensive) preprocessor.
-+ *
-+ * The cache is fully opt-in. If no hooks are registered, behaviour is byte-identical to a
-+ * build without this feature. projectM owns nothing referenced by the value pointers after a
-+ * callback returns; the get sink is only valid for the duration of the sink call.
-+ *
-+ * All hook invocations happen on the same thread that calls the projectM rendering
-+ * functions (the transpile runs there), so no additional synchronization is required.
-+ *
-+ * @since 4.2.0
-+ */
-+typedef struct projectm_preprocess_cache_hooks {
-+    /**
-+     * @brief Lookup hook. On a hit, invoke @p sink exactly once with the cached value (valid
-+     *        only for the duration of that call) and return true. On a miss, return false and
-+     *        do not call @p sink.
-+     */
-+    bool (*get)(void* user, const char* key, size_t keylen,
-+                void* sinkctx, void (*sink)(void* sinkctx, const char* data, size_t len));
-+    /**
-+     * @brief Store hook. Copy @p vallen bytes at @p value under the @p keylen-byte @p key.
-+     *        The callee owns no passed-in pointer after returning.
-+     */
-+    void (*put)(void* user, const char* key, size_t keylen, const char* value, size_t vallen);
-+    void* user; /**< User-defined pointer passed back to get/put. */
-+} projectm_preprocess_cache_hooks;
-+
-+/**
-+ * @brief Registers (or clears) the preprocessed-HLSL cache hooks for this instance.
-+ *
-+ * The hooks structure is copied by value; the caller need not keep it alive, but the @c user
-+ * pointer and anything the callbacks touch must outlive the projectM instance (or until the
-+ * hooks are cleared). Passing NULL clears any previously registered hooks.
-+ *
-+ * @param instance The projectM instance handle.
-+ * @param hooks A pointer to the hooks structure, or NULL to clear.
-+ * @since 4.2.0
-+ */
-+PROJECTM_EXPORT void projectm_set_preprocess_cache(projectm_handle instance,
-+                                                   const projectm_preprocess_cache_hooks* hooks);
-+
-+#ifdef __cplusplus
-+} // extern "C"
-+#endif
 diff --git a/src/api/include/projectM-4/projectM.h b/src/api/include/projectM-4/projectM.h
 index 5b646af4d..b76a888d8 100644
 --- a/src/api/include/projectM-4/projectM.h
@@ -547,7 +454,7 @@ index db8eb43ba..14fb82000 100644
  
  } // namespace MilkdropPreset
 diff --git a/src/libprojectM/MilkdropPreset/MilkdropShader.cpp b/src/libprojectM/MilkdropPreset/MilkdropShader.cpp
-index 10cf919ca..802117848 100644
+index 10cf919ca..995c13c48 100644
 --- a/src/libprojectM/MilkdropPreset/MilkdropShader.cpp
 +++ b/src/libprojectM/MilkdropPreset/MilkdropShader.cpp
 @@ -1,5 +1,7 @@
@@ -558,7 +465,15 @@ index 10cf919ca..802117848 100644
  #include "PresetState.hpp"
  #include "Utils.hpp"
  
-@@ -141,7 +143,11 @@ void MilkdropShader::LoadTexturesAndCompile(PresetState& presetState)
+@@ -13,6 +15,7 @@
+ #include <glm/mat4x4.hpp>
+ 
+ #include <algorithm>
++#include <cstring> // RoonVis local patch: strlen for the Tier-1 parse/generate cache put.
+ #include <regex>
+ #include <set>
+ 
+@@ -141,7 +144,11 @@ void MilkdropShader::LoadTexturesAndCompile(PresetState& presetState)
      }
  
      // Now that we have the textures, transpile the code.
@@ -570,7 +485,7 @@ index 10cf919ca..802117848 100644
  
      // Update blur texture level if shader was compiled successfully.
      presetState.blurTexture.SetRequiredBlurLevel(m_maxBlurLevelRequired);
-@@ -331,182 +337,12 @@ auto MilkdropShader::Shader() -> Renderer::Shader&
+@@ -331,182 +338,12 @@ auto MilkdropShader::Shader() -> Renderer::Shader&
  
  void MilkdropShader::PreprocessPresetShader(std::string& program)
  {
@@ -759,7 +674,7 @@ index 10cf919ca..802117848 100644
  }
  
  void MilkdropShader::GetReferencedSamplers(const std::string& program)
-@@ -615,12 +451,47 @@ void MilkdropShader::TranspileHLSLShader(const PresetState& presetState, std::st
+@@ -615,12 +452,47 @@ void MilkdropShader::TranspileHLSLShader(const PresetState& presetState, std::st
      M4::HLSLTree tree(&allocator);
      M4::HLSLParser parser(&allocator, &tree);
  
@@ -811,343 +726,111 @@ index 10cf919ca..802117848 100644
      }
  
      // Remove previous shader declarations
-diff --git a/src/libprojectM/MilkdropPreset/MilkdropShaderPreprocess.cpp b/src/libprojectM/MilkdropPreset/MilkdropShaderPreprocess.cpp
-new file mode 100644
-index 000000000..315a00228
---- /dev/null
-+++ b/src/libprojectM/MilkdropPreset/MilkdropShaderPreprocess.cpp
-@@ -0,0 +1,251 @@
-+#include "MilkdropShaderPreprocess.hpp"
-+
-+#include "Utils.hpp"
-+
-+#include <MilkdropStaticShaders.hpp>
-+
-+#include <Logging.hpp>
-+#include <Renderer/Shader.hpp>
-+
-+#include <cstddef>
-+#include <cstdint>
-+#include <cstdio>
-+#include <string>
-+
-+namespace libprojectM {
-+namespace MilkdropPreset {
-+
-+using libprojectM::MilkdropPreset::MilkdropStaticShaders;
-+
-+std::string AssembleApplyPreprocessorInput(MilkdropShader::ShaderType type,
-+                                           const std::string& presetShaderBody)
-+{
-+    // RoonVis local patch: byte-for-byte extraction of the pure-text assembly that used to
-+    // live inline in MilkdropShader::PreprocessPresetShader. Do NOT alter any transformation,
-+    // ordering, whitespace, header or #define content — a host tool and the runtime rely on
-+    // producing identical bytes.
-+    std::string program = presetShaderBody;
-+
-+    std::string shaderTypeString = "composite";
-+    if (type == MilkdropShader::ShaderType::WarpShader)
+@@ -669,36 +541,87 @@ void MilkdropShader::TranspileHLSLShader(const PresetState& presetState, std::st
+         sourcePreprocessed.insert(0, samplerDeclaration);
+     }
+ 
+-    // Transpile from HLSL (aka preset shader aka DirectX shader) to GLSL (aka OpenGL shader lang)
+-    // First, parse HLSL into a tree
+-    if (!parser.Parse("", sourcePreprocessed.c_str(), sourcePreprocessed.size()))
++    // RoonVis local patch: Tier-1 parse/generate cache. The HLSL parse + GLSL generation
++    // below is a pure, deterministic function of `sourcePreprocessed` (W4 fidelity spike:
++    // a GL-free host replica of this exact text matched the live app 100% across the full
++    // preset pack), so the generated GLSL can be cached and prepopulated at build time.
++    // Reuses the app-provided preprocess-cache hooks; the second-stage salt
++    // ("pmpp-parse-v1:", ComputeParseGenCacheKey) disambiguates the two stages inside the
++    // one store. A hit skips parser.Parse + generator.Generate entirely; a hit whose GLSL
++    // later fails the GL compile flows into the existing CompileProgram error handling
++    // unchanged. With no hooks registered, behaviour is byte-identical to before.
++    std::string parseGenCacheKey;
++    std::string parseGenCachedGlsl;
++    bool parseGenCacheHit = false;
++    if (preprocessCacheHooks != nullptr && (preprocessCacheHooks->get != nullptr || preprocessCacheHooks->put != nullptr))
+     {
+-        LOG_DEBUG("[MilkdropShader] Failed " + shaderTypeString + " shader code:\n" + program);
+-        LOG_DEBUG("[MilkdropShader] Failed preprocessed " + shaderTypeString + " shader code:\n" + sourcePreprocessed);
+-        throw Renderer::ShaderException("[MilkdropShader] Error translating HLSL " + shaderTypeString + " shader: HLSL parsing failed.");
++        // Computed for either hook: a put-only registration must not store under an empty key.
++        parseGenCacheKey = ComputeParseGenCacheKey(sourcePreprocessed);
+     }
+-
+-    // Then generate GLSL from the resulting parser tree
+-    if (!generator.Generate(&tree, M4::GLSLGenerator::Target_FragmentShader,
+-                            MilkdropStaticShaders::Get()->GetGlslGeneratorVersion(),
+-                            "PS", M4::GLSLGenerator::Options(M4::GLSLGenerator::Flag_AlternateNanPropagation)))
++    if (preprocessCacheHooks != nullptr && preprocessCacheHooks->get != nullptr)
+     {
+-        LOG_DEBUG("[MilkdropShader] Failed " + shaderTypeString + " shader code:\n" + program);
+-        LOG_DEBUG("[MilkdropShader] Failed preprocessed " + shaderTypeString + " shader code:\n" + sourcePreprocessed);
+-        throw Renderer::ShaderException("[MilkdropShader] Error translating HLSL " + shaderTypeString + " shader: GLSL generating failed.\nSource:\n" + sourcePreprocessed);
++        // Sink appends the cached bytes into parseGenCachedGlsl for the duration of the call.
++        auto appendSink = [](void* sinkctx, const char* data, size_t len) {
++            auto* out = static_cast<std::string*>(sinkctx);
++            out->append(data, len);
++        };
++        parseGenCacheHit = preprocessCacheHooks->get(preprocessCacheHooks->user,
++                                                     parseGenCacheKey.data(), parseGenCacheKey.size(),
++                                                     &parseGenCachedGlsl, appendSink);
+     }
+ 
+-    LOG_TRACE("[MilkdropShader] Transpiled GLSL " + shaderTypeString + " shader code:\n" + std::string(generator.GetResult()));
++    // Transpile from HLSL (aka preset shader aka DirectX shader) to GLSL (aka OpenGL shader lang)
++    // RoonVis local patch (Tier-1 parse/generate cache): on a cache hit the parse +
++    // generate stages are skipped entirely and the cached GLSL feeds the same compile path
++    // below. The cached text is byte-identical to what generation produces for this input
++    // (deterministic transpile, host/device fidelity proven by the W4 spike), so behaviour
++    // is identical by construction; all error paths are preserved on the miss path.
++    if (!parseGenCacheHit)
 +    {
-+        shaderTypeString = "warp";
-+    }
-+
-+    if (program.length() <= 0)
-+    {
-+        throw Renderer::ShaderException("[MilkdropShader] Preset " + shaderTypeString + " shader is declared, but empty.");
-+    }
-+
-+    size_t found;
-+
-+    // Find "sampler_state" overrides and remove them first, as they're not supported by GLSL.
-+    // The logic isn't totally fool-proof, but should work in general.
-+    // Use a comment-stripped copy for searching so commented-out sampler_state blocks are skipped.
-+    // StripComments preserves string length, so positions map 1:1 to the original.
-+    std::string stripped = Utils::StripComments(program);
-+    found = stripped.find("sampler_state");
-+    while (found != std::string::npos)
-+    {
-+        // Now go backwards and find the assignment
-+        found = stripped.rfind('=', found);
-+        auto startPos = found;
-+
-+        // Find closing brace and semicolon
-+        found = stripped.find('}', found);
-+        found = stripped.find(';', found);
-+
-+        if (found != std::string::npos)
++        // First, parse HLSL into a tree
++        if (!parser.Parse("", sourcePreprocessed.c_str(), sourcePreprocessed.size()))
 +        {
-+            stripped.replace(startPos, found - startPos, "");
-+        }
-+        else
-+        {
-+            // No closing brace and semicolon.
-+            break;
++            LOG_DEBUG("[MilkdropShader] Failed " + shaderTypeString + " shader code:\n" + program);
++            LOG_DEBUG("[MilkdropShader] Failed preprocessed " + shaderTypeString + " shader code:\n" + sourcePreprocessed);
++            throw Renderer::ShaderException("[MilkdropShader] Error translating HLSL " + shaderTypeString + " shader: HLSL parsing failed.");
 +        }
 +
-+        found = stripped.find("sampler_state");
-+    }
-+
-+    // replace shader_body with entry point function
-+    // Use the stripped copy so a commented-out shader_body is not matched.
-+    found = stripped.find("shader_body");
-+    if (found != std::string::npos)
-+    {
-+        if (type == MilkdropShader::ShaderType::WarpShader)
++        // Then generate GLSL from the resulting parser tree
++        if (!generator.Generate(&tree, M4::GLSLGenerator::Target_FragmentShader,
++                                MilkdropStaticShaders::Get()->GetGlslGeneratorVersion(),
++                                "PS", M4::GLSLGenerator::Options(M4::GLSLGenerator::Flag_AlternateNanPropagation)))
 +        {
-+            program.replace(int(found), 11, R"(
-+void PS(float4 _vDiffuse : COLOR,
-+        float4 _uv : TEXCOORD0,
-+        float2 _rad_ang : TEXCOORD1,
-+        out float4 _return_value : COLOR0,
-+        out float4 _mv_tex_coords : COLOR1)
-+)");
++            LOG_DEBUG("[MilkdropShader] Failed " + shaderTypeString + " shader code:\n" + program);
++            LOG_DEBUG("[MilkdropShader] Failed preprocessed " + shaderTypeString + " shader code:\n" + sourcePreprocessed);
++            throw Renderer::ShaderException("[MilkdropShader] Error translating HLSL " + shaderTypeString + " shader: GLSL generating failed.\nSource:\n" + sourcePreprocessed);
 +        }
-+        else
++
++        // RoonVis local patch (Tier-1 parse/generate cache): store the freshly generated
++        // GLSL under the second-stage key so the next load of this shader skips parse/gen.
++        if (preprocessCacheHooks != nullptr && preprocessCacheHooks->put != nullptr)
 +        {
-+            program.replace(int(found), 11, R"(
-+void PS(float4 _vDiffuse : COLOR,
-+        float2 _uv : TEXCOORD0,
-+        float2 _rad_ang : TEXCOORD1,
-+        out float4 _return_value : COLOR)
-+)");
-+        }
-+    }
-+    else
-+    {
-+        LOG_DEBUG("[MilkdropShader] Failed " + shaderTypeString + " shader code:\n" + program);
-+        throw Renderer::ShaderException("[MilkdropShader] Preset " + shaderTypeString + " shader is missing \"shader_body\" entry point.");
-+    }
-+
-+    // replace the "{" immediately following shader_body with some variable declarations
-+    found = program.find('{', found);
-+    if (found != std::string::npos)
-+    {
-+        std::string progMain = "{\nfloat3 ret = 0;\n";
-+        if (type == MilkdropShader::ShaderType::WarpShader)
-+        {
-+            progMain.append("_mv_tex_coords.xy = _uv.xy;\n");
-+        }
-+        program.replace(int(found), 1, progMain);
-+    }
-+    else
-+    {
-+        LOG_DEBUG("[MilkdropShader] Failed " + shaderTypeString + " shader code:\n" + program);
-+        throw Renderer::ShaderException("[MilkdropShader] Preset " + shaderTypeString + " shader has no opening braces.");
-+    }
-+
-+    // replace "}" with return statement (this can probably be optimized for the GLSL conversion...)
-+    found = program.rfind('}');
-+    if (found != std::string::npos)
-+    {
-+        program.replace(int(found), 1, "_return_value = float4(ret.xyz, 1.0);\n"
-+                                       "}\n");
-+    }
-+    else
-+    {
-+        LOG_DEBUG("[MilkdropShader] Failed " + shaderTypeString + " shader code:\n" + program);
-+        throw Renderer::ShaderException("[MilkdropShader] Preset " + shaderTypeString + " shader has no closing brace.");
-+    }
-+
-+    // Find matching closing brace and cut off excess text after shader's main function
-+    int bracesOpen = 1;
-+    size_t pos = found + 1;
-+    for (; pos < program.length() && bracesOpen > 0; ++pos)
-+    {
-+        switch (program.at(pos))
-+        {
-+            case '/':
-+                // Skip line comments until EoL to prevent false counting
-+                if (pos < program.length() - 1 && program.at(pos + 1) == '/')
-+                {
-+                    for (; pos < program.length(); ++pos)
-+                    {
-+                        if (program.at(pos) == '\n')
-+                        {
-+                            break;
-+                        }
-+                    }
-+                }
-+                // Skip block comments to prevent false counting
-+                else if (pos < program.length() - 1 && program.at(pos + 1) == '*')
-+                {
-+                    pos += 2;
-+                    for (; pos < program.length() - 1; ++pos)
-+                    {
-+                        if (program.at(pos) == '*' && program.at(pos + 1) == '/')
-+                        {
-+                            ++pos; // skip past '/'
-+                            break;
-+                        }
-+                    }
-+                }
-+                continue;
-+
-+            case '{':
-+                bracesOpen++;
-+                continue;
-+
-+            case '}':
-+                bracesOpen--;
++            const char* generatedGlsl = generator.GetResult();
++            preprocessCacheHooks->put(preprocessCacheHooks->user,
++                                      parseGenCacheKey.data(), parseGenCacheKey.size(),
++                                      generatedGlsl, std::strlen(generatedGlsl));
 +        }
 +    }
 +
-+    if (pos < program.length() - 1)
-+    {
-+        program.resize(pos);
-+    }
++    // RoonVis local patch (Tier-1 parse/generate cache): single fragment-source seam for
++    // the compile below — cached GLSL on a hit, generator output on a miss.
++    const char* fragmentGlsl = parseGenCacheHit ? parseGenCachedGlsl.c_str() : generator.GetResult();
 +
-+    std::string fullSource; //!< Full shader source before translation, includes all uniforms etc.
-+
-+    // First copy the generic "header" into the shader. Includes uniforms and some defines
-+    // to unwrap the packed 4-element uniforms into single values.
-+    fullSource.append(MilkdropStaticShaders::Get()->GetPresetShaderHeader());
-+
-+    if (type == MilkdropShader::ShaderType::WarpShader)
-+    {
-+        fullSource.append("#define rad _rad_ang.x\n"
-+                          "#define ang _rad_ang.y\n"
-+                          "#define uv _uv.xy\n"
-+                          "#define uv_orig _uv.zw\n");
-+    }
-+    else
-+    {
-+        fullSource.append("#define rad _rad_ang.x\n"
-+                          "#define ang _rad_ang.y\n"
-+                          "#define uv _uv.xy\n"
-+                          "#define uv_orig _uv.xy\n"
-+                          "#define hue_shader _vDiffuse.xyz\n");
-+    }
-+
-+    fullSource.append(program);
-+
-+    return fullSource;
-+}
-+
-+namespace {
-+
-+// Compile-time salt. Bump this string whenever anything that changes the produced GLSL for
-+// a given input changes: the static preset shader header, the hlslparser/ApplyPreprocessor
-+// implementation, or AssembleApplyPreprocessorInput above. Bumping invalidates every stale
-+// cache entry (old keys can no longer be produced).
-+constexpr const char* kPreprocessCacheSalt = "pmpp-v1:";
-+
-+uint64_t Fnv1a64(const std::string& data, uint64_t offsetBasis)
-+{
-+    constexpr uint64_t prime = 1099511628211ull;
-+    uint64_t hash = offsetBasis;
-+    for (const char c : data)
-+    {
-+        hash ^= static_cast<uint64_t>(static_cast<unsigned char>(c));
-+        hash *= prime;
-+    }
-+    return hash;
-+}
-+
-+} // namespace
-+
-+std::string ComputePreprocessCacheKey(const std::string& applyPreprocessorInput)
-+{
-+    // Two independent FNV-1a passes with different offset bases (the second is the standard
-+    // basis byte-reversed) give ~128 bits of effective hash; the length is embedded too.
-+    const uint64_t h1 = Fnv1a64(applyPreprocessorInput, 14695981039346656037ull);
-+    const uint64_t h2 = Fnv1a64(applyPreprocessorInput, 0x84222325cbf29ce4ull);
-+
-+    char buffer[64];
-+    std::snprintf(buffer, sizeof(buffer), "%016llx%016llx-%zx",
-+                  static_cast<unsigned long long>(h1),
-+                  static_cast<unsigned long long>(h2),
-+                  applyPreprocessorInput.size());
-+
-+    return std::string(kPreprocessCacheSalt) + buffer;
-+}
-+
-+std::string PreprocessCacheSalt()
-+{
-+    return kPreprocessCacheSalt;
-+}
-+
-+} // namespace MilkdropPreset
-+} // namespace libprojectM
-diff --git a/src/libprojectM/MilkdropPreset/MilkdropShaderPreprocess.hpp b/src/libprojectM/MilkdropPreset/MilkdropShaderPreprocess.hpp
-new file mode 100644
-index 000000000..d1b93d6a1
---- /dev/null
-+++ b/src/libprojectM/MilkdropPreset/MilkdropShaderPreprocess.hpp
-@@ -0,0 +1,74 @@
-+/**
-+ * @file MilkdropShaderPreprocess.hpp
-+ * @brief GL-free, pure-text assembly of the input passed to the HLSL preprocessor.
-+ *
-+ * RoonVis local patch: extracted from MilkdropShader::PreprocessPresetShader so the exact
-+ * string handed to HLSLParser::ApplyPreprocessor can be produced without a MilkdropShader
-+ * instance, a GL context, textures, or PresetState. This is the shared foundation for a
-+ * runtime shader-transpile cache and a build-time (host) precompute tool: both call this
-+ * function and must get byte-identical output.
-+ */
-+#pragma once
-+
-+#include "MilkdropShader.hpp"
-+
-+#include <string>
-+
-+namespace libprojectM {
-+namespace MilkdropPreset {
-+
-+/**
-+ * @brief Assembles the pure-text shader source that is later passed to the HLSL
-+ *        preprocessor (HLSLParser::ApplyPreprocessor).
-+ *
-+ * This is a pure function of (shader type, preset shader body): it renames the preset's
-+ * shader entry point to PS(), strips unsupported sampler_state{} blocks, injects the
-+ * per-type variable declarations, trims trailing text after the shader's main function,
-+ * and prepends the static preset shader header plus the type-specific #defines. It does
-+ * NOT touch GL, Renderer::Shader, textures, or PresetState.
-+ *
-+ * The output is byte-for-byte identical to what MilkdropShader::PreprocessPresetShader
-+ * historically produced in-place.
-+ *
-+ * @param type The preset shader type (warp or composite).
-+ * @param presetShaderBody The raw preset shader body (as loaded from the preset).
-+ * @return The fully assembled shader source ready for the HLSL preprocessor.
-+ * @throws Renderer::ShaderException If the body is empty or malformed (missing
-+ *         "shader_body", opening brace, or closing brace) — same messages/type as before.
-+ */
-+std::string AssembleApplyPreprocessorInput(MilkdropShader::ShaderType type,
-+                                           const std::string& presetShaderBody);
-+
-+/**
-+ * @brief Computes a version-salted, collision-safe cache key for a preprocessed-HLSL
-+ *        lookup, from the exact bytes handed to HLSLParser::ApplyPreprocessor.
-+ *
-+ * GL-free and side-effect-free, so the runtime transpile path and a future build-time
-+ * precompute tool compute byte-identical keys for identical inputs.
-+ *
-+ * Collision safety: the key embeds a compile-time salt (bumped whenever the static shader
-+ * header, the hlslparser, or the assembly transform changes — invalidating stale entries),
-+ * the input length, and two independent 64-bit FNV-1a hashes seeded with different offset
-+ * bases. That is ~128 bits of effective hash plus an exact length check, so accidental
-+ * collisions are astronomically unlikely (and a length mismatch alone rules most out).
-+ * The value stored under a key is deterministic text, so even in the impossible event of a
-+ * full collision the only effect would be reusing a valid-but-wrong transpile — never a
-+ * crash. Callers may treat a hit as authoritative.
-+ *
-+ * @param applyPreprocessorInput The exact string that would be passed to ApplyPreprocessor
-+ *        (i.e. the return value of AssembleApplyPreprocessorInput).
-+ * @return A printable ASCII cache key.
-+ */
-+std::string ComputePreprocessCacheKey(const std::string& applyPreprocessorInput);
-+
-+/**
-+ * @brief Returns the compile-time version salt embedded in every cache key.
-+ *
-+ * Exposed so a build-time precompute tool can stamp the exact same salt into its resource
-+ * header without duplicating the constant (the tool and ComputePreprocessCacheKey must not
-+ * drift). Bumping the salt in the .cpp invalidates every stale precomputed/runtime entry.
-+ */
-+std::string PreprocessCacheSalt();
-+
-+} // namespace MilkdropPreset
-+} // namespace libprojectM
++    LOG_TRACE("[MilkdropShader] Transpiled GLSL " + shaderTypeString + " shader code:\n" + std::string(fragmentGlsl));
+ 
+     // Now we have GLSL source for the preset shader program (hopefully it's valid!)
+     // Compile the preset shader fragment shader with the standard vertex shader and cross our fingers.
+     if (m_type == ShaderType::WarpShader)
+     {
+-        m_shader.CompileProgram(MilkdropStaticShaders::Get()->GetPresetWarpVertexShader(), generator.GetResult());
++        m_shader.CompileProgram(MilkdropStaticShaders::Get()->GetPresetWarpVertexShader(), fragmentGlsl);
+     }
+     else
+     {
+-        m_shader.CompileProgram(MilkdropStaticShaders::Get()->GetPresetCompVertexShader(), generator.GetResult());
++        m_shader.CompileProgram(MilkdropStaticShaders::Get()->GetPresetCompVertexShader(), fragmentGlsl);
+     }
+ }
+ 
 diff --git a/src/libprojectM/MilkdropPreset/PerFrameContext.cpp b/src/libprojectM/MilkdropPreset/PerFrameContext.cpp
 index b2063825b..23be83435 100644
 --- a/src/libprojectM/MilkdropPreset/PerFrameContext.cpp

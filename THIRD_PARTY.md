@@ -7,7 +7,7 @@ builds on the following third-party components, each under its own license:
 |---|---|---|---|
 | **projectM** (libprojectM) | `vendor/projectm` (git submodule, patched) | **LGPL-2.1** | Modified. See below. |
 | **ANGLE** | `vendor/angle` (git submodule) | **BSD-3-Clause** | Google's OpenGL-ES-over-Metal implementation. |
-| **Milkdrop presets** | `RoonVis/Resources/presets/` | **Public domain** | Curated subset of the projectM *Cream of the Crop* pack. |
+| **Milkdrop presets** | `RoonVis/Resources/presets/` | **Public domain** | The full projectM *Cream of the Crop* pack (7,700+ presets, tree layout with category metadata). |
 | **Textures** | `RoonVis/Resources/textures/` | **Public domain** | projectM *Milkdrop texture pack*. |
 
 ## projectM (LGPL-2.1) — how we comply

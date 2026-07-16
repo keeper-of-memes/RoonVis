@@ -59,7 +59,7 @@ struct QuickSettingsPanelView: View {
         RVSegmentRow(
             systemImage: "arrow.triangle.2.circlepath",
             title: "Preset Rotation",
-            segments: ["Loop", "Shuffle", "Favourites"],
+            segments: ["Loop", "Shuffle", "Favourites", "Category"],
             selection: presetRotationModeBinding
         )
     }
@@ -130,6 +130,8 @@ struct QuickSettingsPanelView: View {
                     return 0
                 case .favorites:
                     return 2
+                case .category:
+                    return 3
                 case .shuffle:
                     return 1
                 @unknown default:
@@ -142,6 +144,8 @@ struct QuickSettingsPanelView: View {
                     settings.presetRotationMode = .loop
                 case 2:
                     settings.presetRotationMode = .favorites
+                case 3:
+                    settings.presetRotationMode = .category
                 default:
                     settings.presetRotationMode = .shuffle
                 }

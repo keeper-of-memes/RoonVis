@@ -156,7 +156,7 @@ private struct BrowseModalRootView: View {
         onHidePreset: @escaping (Int) -> Void,
         onDismiss: @escaping () -> Void,
         onCalibrateSync: @escaping () -> Void = {},
-        onSelectedTabChange: @escaping (BrowseModalTab) -> Void
+        onSelectedTabChange: @escaping (BrowseModalTab) -> Void = { _ in }
     ) {
         _settings = StateObject(wrappedValue: settings)
         _engine = StateObject(wrappedValue: engine)
@@ -193,12 +193,6 @@ private struct BrowseModalRootView: View {
         make(glView: glView, initialTab: .presets)
     }
 
-    @objc(makeWithGlView:)
-    @MainActor
-    static func make(glView: ANGLEGLView) -> UIViewController {
-        make(glView: glView, initialTab: glView.roonVisUIEnvironment.lastBrowseTab)
-    }
-
     @MainActor
     static func make(glView: ANGLEGLView, initialTab: BrowseModalTab) -> UIViewController {
         let environment = glView.roonVisUIEnvironment
@@ -221,9 +215,6 @@ private struct BrowseModalRootView: View {
                 },
                 onCalibrateSync: {
                     glView.presentSyncCalibrationFromUI()
-                },
-                onSelectedTabChange: { tab in
-                    environment.lastBrowseTab = tab
                 }
             )
         )

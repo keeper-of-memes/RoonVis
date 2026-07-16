@@ -1,0 +1,44 @@
+# guardrail-allowlist.txt — files permitted to read NSUserDefaults / touch persistent
+# domains today. One path-substring per line (matched against grep -F). This is the
+# BASELINE of current reality (2026-07-10); the gate exists to catch NEW sites that
+# appear OUTSIDE this list. Trim an entry when a file legitimately stops reading defaults.
+# See build-health.sh GUARDRAIL GREPS. Comments (#) and blank lines are ignored.
+
+# --- Settings: the single source-of-truth loader; reads all persisted settings at
+#     init/migration only, then serves ivars from memory (truth-in-memory design).
+RoonVisSettings.mm
+
+# --- Legacy shuffle-order name migration: one-shot read of the legacy defaults keys
+#     (arrayForKey/boolForKey) + synchronize to record the migration-applied flag.
+LegacyNameMigrationSupport.mm
+
+# --- ProjectMBridge core: diagnostic-mode flags (transition profile / perf sweep /
+#     crasher scan), sync-render compensation, and the self-healing / learned-slow +
+#     legacy-shuffle persistence reads.
+ProjectMBridge.mm
+
+# --- ProjectMBridge warm-cache extension: learned-slow preset list persistence
+#     (read/clear + HD-seed one-shot) via defaults array + synchronize.
+ProjectMBridge+Warm.mm
+
+# --- ProjectMBridge presets extension: reads the last-shown preset filename to
+#     restore rotation position on launch.
+ProjectMBridge+Presets.mm
+
+# --- ProjectM preset support: reads the dev/QA extra crash-blocklist override.
+ProjectMPresetSupport.mm
+
+# --- Preset warm-cache settings shim: reads warm-cache enabled flag + strategy.
+PresetWarmSettings.mm
+
+# --- ANGLEGLView core: reads perf-diagnostics-enabled and disable-slow-preset-skip
+#     diagnostic flags at render setup.
+ANGLEGLView.mm
+
+# --- ANGLEGLView controls extension: reads the visualizer-hint-seen flag (one-shot
+#     onboarding hint gating).
+ANGLEGLView+Controls.mm
+
+# --- Shader blob cache adapter: reads the RoonVisShaderBlobCacheEnabled kill switch
+#     ONCE at EGL registration (init-time; never on the render path).
+ShaderBlobCacheAdapter.mm

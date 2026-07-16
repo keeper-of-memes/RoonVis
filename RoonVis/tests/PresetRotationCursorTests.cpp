@@ -136,16 +136,114 @@ void TestReEligibleEntryKeepsPosition()
 void TestShuffleFingerprint()
 {
     // Order-insensitive over both inputs.
-    CHECK(ShuffleOrderFingerprint({"a.milk", "b.milk"}, {"s.milk"}) ==
-          ShuffleOrderFingerprint({"b.milk", "a.milk"}, {"s.milk"}));
+    CHECK(ShuffleOrderFingerprint({"a.milk", "b.milk"}, {"s.milk"}, "") ==
+          ShuffleOrderFingerprint({"b.milk", "a.milk"}, {"s.milk"}, ""));
     // Pack change invalidates.
-    CHECK(ShuffleOrderFingerprint({"a.milk", "b.milk"}, {}) !=
-          ShuffleOrderFingerprint({"a.milk", "c.milk"}, {}));
+    CHECK(ShuffleOrderFingerprint({"a.milk", "b.milk"}, {}, "") !=
+          ShuffleOrderFingerprint({"a.milk", "c.milk"}, {}, ""));
     // Learned-slow confirmed-set change invalidates.
-    CHECK(ShuffleOrderFingerprint({"a.milk", "b.milk"}, {}) !=
-          ShuffleOrderFingerprint({"a.milk", "b.milk"}, {"a.milk"}));
+    CHECK(ShuffleOrderFingerprint({"a.milk", "b.milk"}, {}, "") !=
+          ShuffleOrderFingerprint({"a.milk", "b.milk"}, {"a.milk"}, ""));
     // Concatenation ambiguity guarded ({"ab"} vs {"a","b"}).
-    CHECK(ShuffleOrderFingerprint({"ab"}, {}) != ShuffleOrderFingerprint({"a", "b"}, {}));
+    CHECK(ShuffleOrderFingerprint({"ab"}, {}, "") != ShuffleOrderFingerprint({"a", "b"}, {}, ""));
+}
+
+// Scope is part of the fingerprint identity: equal member sets in different
+// scopes must never validate each other's stored orders.
+void TestShuffleFingerprintScope()
+{
+    // Same inputs, different scope -> different value.
+    CHECK(ShuffleOrderFingerprint({"a.milk", "b.milk"}, {}, "") !=
+          ShuffleOrderFingerprint({"a.milk", "b.milk"}, {}, "Fractal"));
+    CHECK(ShuffleOrderFingerprint({"a.milk", "b.milk"}, {}, "Fractal") !=
+          ShuffleOrderFingerprint({"a.milk", "b.milk"}, {}, "Drawing"));
+    // Same scope -> stable.
+    CHECK(ShuffleOrderFingerprint({"a.milk", "b.milk"}, {"s.milk"}, "Fractal") ==
+          ShuffleOrderFingerprint({"b.milk", "a.milk"}, {"s.milk"}, "Fractal"));
+    // Scope/member concatenation ambiguity guarded: the scope accumulates
+    // through the same separator machinery as the name lists.
+    CHECK(ShuffleOrderFingerprint({"a.milk"}, {}, "xy") !=
+          ShuffleOrderFingerprint({"a.milk", "xy"}, {}, ""));
+    // Learned-slow changes invalidate scoped fingerprints too.
+    CHECK(ShuffleOrderFingerprint({"a.milk", "b.milk"}, {}, "Fractal") !=
+          ShuffleOrderFingerprint({"a.milk", "b.milk"}, {"a.milk"}, "Fractal"));
+}
+
+// Category rotation: full-order membership follows the anchor preset's
+// category and RETAINS hidden/slow entries (exclusion is the advance
+// predicate's job, never a membership edit).
+void TestCategoryMemberIndexes()
+{
+    const std::vector<std::string> categories = {
+        "Fractal",  // 0
+        "Drawing",  // 1
+        "Fractal",  // 2
+        "Waveform", // 3
+        "Fractal",  // 4
+        "Drawing",  // 5
+    };
+
+    // Membership, in pack order.
+    CHECK((CategoryMemberIndexes(categories, "Fractal") == std::vector<size_t>{0, 2, 4}));
+    CHECK((CategoryMemberIndexes(categories, "Drawing") == std::vector<size_t>{1, 5}));
+    CHECK((CategoryMemberIndexes(categories, "Waveform") == std::vector<size_t>{3}));
+    CHECK(CategoryMemberIndexes(categories, "Nope").empty());
+    // Empty category never matches (uncategorised packs have no membership).
+    CHECK(CategoryMemberIndexes({"", "Fractal", ""}, "").empty());
+
+    // Anchor-follow: the order is built from the ANCHOR's category, so moving
+    // the anchor to another category swaps the member set.
+    const size_t anchorA = 2; // Fractal
+    const size_t anchorB = 5; // Drawing
+    CHECK((CategoryMemberIndexes(categories, categories[anchorA]) == std::vector<size_t>{0, 2, 4}));
+    CHECK((CategoryMemberIndexes(categories, categories[anchorB]) == std::vector<size_t>{1, 5}));
+
+    // Hidden retained in the full order: a hidden member (2) stays in the
+    // membership; the cursor's exclusion predicate skips it while the anchor
+    // remains findable at its order position.
+    std::vector<size_t> order = CategoryMemberIndexes(categories, "Fractal");
+    CHECK((order == std::vector<size_t>{0, 2, 4}));
+    auto r = AdvanceRotationCursor(order, 0, 1, ExcludeSet({2}));
+    CHECK(r.valid && r.index == 4);
+    // Even the anchor itself being hidden keeps the walk in order.
+    r = AdvanceRotationCursor(order, 2, 1, ExcludeSet({2}));
+    CHECK(r.valid && r.index == 4);
+}
+
+// Scoped-store non-clobber round trip: writing category scopes never touches
+// the global Shuffle entry (scope ""), so leaving Category mode resumes the
+// identical persisted sequence.
+void TestScopedStoreNonClobber()
+{
+    const ScopedRotationOrder shuffleEntry = {{"c.milk", "a.milk", "b.milk"}, "sfp1-global"};
+
+    ScopedRotationOrderStore store;
+    store = UpsertScopedRotationOrder(store, "", shuffleEntry);
+    REQUIRE(store.count("") == 1);
+
+    // Enter Category mode: seed two category scopes.
+    store = UpsertScopedRotationOrder(store, "Fractal", {{"f2.milk", "f1.milk"}, "sfp1-fractal"});
+    store = UpsertScopedRotationOrder(store, "Drawing", {{"d1.milk", "d3.milk", "d2.milk"}, "sfp1-drawing"});
+
+    // Scope "" is byte-identical after the category writes.
+    REQUIRE(store.count("") == 1);
+    CHECK(store.at("").filenames == shuffleEntry.filenames);
+    CHECK(store.at("").fingerprint == shuffleEntry.fingerprint);
+
+    // Re-seeding one category replaces only that scope.
+    store = UpsertScopedRotationOrder(store, "Fractal", {{"f1.milk", "f2.milk"}, "sfp1-fractal2"});
+    CHECK((store.at("Fractal").filenames == std::vector<std::string>{"f1.milk", "f2.milk"}));
+    CHECK(store.at("Fractal").fingerprint == "sfp1-fractal2");
+    CHECK((store.at("Drawing").filenames == std::vector<std::string>{"d1.milk", "d3.milk", "d2.milk"}));
+    CHECK(store.at("").filenames == shuffleEntry.filenames);
+    CHECK(store.at("").fingerprint == shuffleEntry.fingerprint);
+    CHECK(store.size() == 3);
+
+    // And the inverse: a global Shuffle reseed leaves category scopes intact.
+    store = UpsertScopedRotationOrder(store, "", {{"b.milk", "c.milk", "a.milk"}, "sfp1-global2"});
+    CHECK(store.at("Fractal").fingerprint == "sfp1-fractal2");
+    CHECK(store.at("Drawing").fingerprint == "sfp1-drawing");
+    CHECK((store.at("").filenames == std::vector<std::string>{"b.milk", "c.milk", "a.milk"}));
 }
 
 void TestRestoreShuffleOrder()
@@ -204,6 +302,9 @@ void RunPresetRotationCursorTests()
     TestBoundaryAnchorExcludedWraps();
     TestReEligibleEntryKeepsPosition();
     TestShuffleFingerprint();
+    TestShuffleFingerprintScope();
+    TestCategoryMemberIndexes();
+    TestScopedStoreNonClobber();
     TestRestoreShuffleOrder();
     TestPersistedOrderSurvivesMidSessionHide();
 }

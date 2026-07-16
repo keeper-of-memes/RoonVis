@@ -1,11 +1,27 @@
 #pragma once
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <vector>
 
 namespace RoonVis
 {
+
+// Frames of delay backlog to hold for a requested `delayMs`, clamped to `clampMs` (the
+// real ceiling budgeted by the latency lock: user audio delay + sync-render compensation)
+// and capped one frame below `maxBufferFrames`. Pure so it is host-testable; the ObjC
+// wrapper (ProjectMBridgeInternal.h) passes the app's kLivePCMDelayClampMs constant.
+inline size_t LivePCMDelayFramesForMs(int64_t delayMs,
+                                      int64_t clampMs,
+                                      uint32_t sampleRate,
+                                      size_t maxBufferFrames)
+{
+    const int64_t clampedMs = std::max<int64_t>(0, std::min<int64_t>(clampMs, delayMs));
+    const size_t frames = (static_cast<size_t>(clampedMs) * sampleRate) / 1000;
+    const size_t ceiling = maxBufferFrames > 0 ? maxBufferFrames - 1 : 0;
+    return std::min(frames, ceiling);
+}
 
 constexpr size_t kSnapcastBaseHeaderSize = 26;
 constexpr uint32_t kMaxSnapcastBodySize = 16u * 1024u * 1024u;

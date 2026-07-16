@@ -40,12 +40,28 @@ FOUNDATION_EXPORT NSInteger RoonVisEffectiveFrameRate(UIView *view);
     double _latencyLockTotalSwapDuration;
     NSUInteger _latencyLockFrames;
     BOOL _latencyLockDidLogFirstWindow;
+    // Live HUD sampler (W8 RC feedback): decoupled from the 5s diagnostics
+    // window so the overlay is live from the first poll and independent of
+    // _perfDiagnosticsEnabled staleness. Written on the GL thread, read from
+    // the main-thread HUD poll; integer tearing is acceptable for a HUD.
+    uint64_t _hudFrameCount;
+    CFTimeInterval _hudSampleStartTime;
+    CFTimeInterval _hudLastFrameTime;
+    NSUInteger _hudDroppedFrames;
+    NSInteger _hudDropPresetIndex;
     double _diagnosticsFPS;
     double _diagnosticsFrameTimeMs;
     NSUInteger _consecutiveSwapFailures;
+    // Throttles the drawFrame no-surface recovery retry (Finding 4): counts skipped
+    // frames with no EGL surface so recovery is re-attempted every
+    // kSwapFailureRecoveryThreshold-th frame instead of being frozen.
+    NSUInteger _surfaceRecoveryAttemptCounter;
     CFTimeInterval _currentFrameInterval;
     NSUInteger _slowPresetFrameCount;
     NSString *_slowPresetName;
+    // Compat burn-in per-preset accumulators (diagnostic builds; Diagnostics).
+    NSString *_compatBurnInPresetName;
+    CFTimeInterval _compatBurnInMaxRenderSeconds;
     BOOL _disableSlowPresetSkip;
     NSMutableOrderedSet *_wouldSkipSlowPresetNames;
     NSString *_lastDiagnosticPresetName;
@@ -83,7 +99,7 @@ FOUNDATION_EXPORT NSInteger RoonVisEffectiveFrameRate(UIView *view);
 @property(nonatomic, retain, nullable) UIViewController *syncCalibrationController;
 
 - (BOOL)setupEGL;
-- (BOOL)recreateSurfaceIfNeededForDrawableSize:(CGSize)drawableSize;
+- (BOOL)ensureSurfaceForDrawableSize:(CGSize)drawableSize;
 - (void)applyDisplayTimingToDisplayLink;
 - (void)screenModeDidChange:(NSNotification *)notification;
 - (void)installOverlayViews;
@@ -104,6 +120,9 @@ FOUNDATION_EXPORT NSInteger RoonVisEffectiveFrameRate(UIView *view);
 - (void)updateLatencyLockWithRender:(double)renderDuration swap:(double)swapDuration atTime:(CFTimeInterval)now;
 - (void)logPerformanceDiagnosticsIfNeededAtTime:(CFTimeInterval)now;
 - (void)recordPresetRenderDuration:(CFTimeInterval)renderDuration;
+// Variadic (NSString format). Declared here so cross-file callers get the real
+// prototype — an undeclared variadic ObjC call compiles on a guessed signature.
+- (void)logTransitionDiagnosticLine:(NSString *)format, ... NS_FORMAT_FUNCTION(1, 2);
 
 @end
 

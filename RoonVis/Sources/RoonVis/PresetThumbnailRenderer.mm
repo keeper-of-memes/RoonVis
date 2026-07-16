@@ -13,6 +13,7 @@
 #import <projectM-4/projectM.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -144,7 +145,7 @@ static UIImage *ImageFromGLRGBABottomLeftPixels(const std::vector<uint8_t> &pixe
 
 @interface PresetThumbnailRenderer ()
 - (UIImage *)cachedImageForPresetPath:(NSString *)path;
-- (UIImage *)renderThumbnailForPresetPath:(NSString *)path;
+- (UIImage *)renderThumbnailForPresetPath:(NSString *)path generation:(int64_t)generation;
 - (BOOL)ensureRenderer;
 - (BOOL)ensureFramebuffer;
 - (void)destroyRenderer;
@@ -161,6 +162,9 @@ static UIImage *ImageFromGLRGBABottomLeftPixels(const std::vector<uint8_t> &pixe
     GLuint _framebuffer;
     GLuint _colorRenderbuffer;
     RoonVis::WavData _wav;
+    // Bumped by cancelPendingThumbnails (any thread). Each job captures this at enqueue;
+    // a job whose captured value is stale skips its live render. Cheap relaxed compare.
+    std::atomic<int64_t> _thumbnailGeneration;
 }
 
 + (instancetype)sharedRenderer
@@ -183,8 +187,17 @@ static UIImage *ImageFromGLRGBABottomLeftPixels(const std::vector<uint8_t> &pixe
         _eglSurface = EGL_NO_SURFACE;
         _eglContext = EGL_NO_CONTEXT;
         _eglConfig = nullptr;
+        _thumbnailGeneration.store(0, std::memory_order_relaxed);
     }
     return self;
+}
+
+- (void)cancelPendingThumbnails
+{
+    // Invalidate every job enqueued at the current generation. Queued live renders that
+    // haven't started (still on the serial queue) return nil early at dequeue; an in-flight
+    // render aborts at its next loop iteration. Cache/bundled dequeues are unaffected.
+    _thumbnailGeneration.fetch_add(1, std::memory_order_relaxed);
 }
 
 - (void)thumbnailForPresetPath:(NSString *)path completion:(void (^)(UIImage *image))completion
@@ -204,12 +217,17 @@ static UIImage *ImageFromGLRGBABottomLeftPixels(const std::vector<uint8_t> &pixe
 
     NSString *presetPath = [path copy];
     void (^completionCopy)(UIImage *) = [completion copy];
+    // Capture the generation at enqueue: cancelPendingThumbnails bumps it, marking every
+    // already-queued job stale so its (slow) live render is skipped after dequeue.
+    const int64_t generation = _thumbnailGeneration.load(std::memory_order_relaxed);
     dispatch_async(_queue, ^{
         NSAutoreleasePool *pool = [[NSAutoreleasePool alloc] init];
+        // Cache/bundled hits are fast — never cancelled once dequeued. Only the LIVE
+        // RENDER path is gated on the generation.
         UIImage *image = [self cachedImageForPresetPath:presetPath];
         if (image == nil)
         {
-            image = [self renderThumbnailForPresetPath:presetPath];
+            image = [self renderThumbnailForPresetPath:presetPath generation:generation];
         }
         UIImage *result = [image retain];
         dispatch_async(dispatch_get_main_queue(), ^{
@@ -370,8 +388,15 @@ static UIImage *ImageFromGLRGBABottomLeftPixels(const std::vector<uint8_t> &pixe
     return YES;
 }
 
-- (UIImage *)renderThumbnailForPresetPath:(NSString *)path
+- (UIImage *)renderThumbnailForPresetPath:(NSString *)path generation:(int64_t)generation
 {
+    // Stale at dequeue: the card scrolled away or Browse was dismissed while this job
+    // waited its turn on the serial queue. Skip the live render entirely.
+    if (_thumbnailGeneration.load(std::memory_order_relaxed) != generation)
+    {
+        return nil;
+    }
+
     BOOL perfCountersEnabled = RoonVisPerfCountersEnabled();
     CFAbsoluteTime liveRenderStart = perfCountersEnabled ? CFAbsoluteTimeGetCurrent() : 0;
     if (![self ensureRenderer])
@@ -400,6 +425,13 @@ static UIImage *ImageFromGLRGBABottomLeftPixels(const std::vector<uint8_t> &pixe
     unsigned int frames = 0;
     while (CFAbsoluteTimeGetCurrent() - renderStart < kThumbnailDurationSeconds && frames < kThumbnailMaxFrames)
     {
+        // Abort mid-render if cancelled (card scrolled away / Browse dismissed): one relaxed
+        // compare per iteration keeps the backlog from draining against the live visualizer.
+        if (_thumbnailGeneration.load(std::memory_order_relaxed) != generation)
+        {
+            glBindFramebuffer(GL_FRAMEBUFFER, 0);
+            return nil;
+        }
         frames++;
         size_t framesRemaining = framesPerAudioTick;
         while (framesRemaining > 0)

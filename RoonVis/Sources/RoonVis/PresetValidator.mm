@@ -92,7 +92,19 @@ static void PresetSwitchFailedCallback(const char *presetFilename, const char *m
         self.previousMean = -1.0;
         self.reportLines = [NSMutableArray array];
 
-        NSArray<NSString *> *paths = [[NSBundle mainBundle] pathsForResourcesOfType:@"milk" inDirectory:@"presets"];
+        // Recursive walk: pathsForResourcesOfType is non-recursive, and the CotC
+        // pack is a <Category>/<Sub>/ tree — the flat lookup finds 0 presets there
+        // (validator predates the tree layout; the bridge already walks it).
+        NSString *presetsRoot = [NSBundle.mainBundle.resourcePath stringByAppendingPathComponent:@"presets"];
+        NSMutableArray<NSString *> *paths = [NSMutableArray array];
+        NSDirectoryEnumerator<NSString *> *walker = [NSFileManager.defaultManager enumeratorAtPath:presetsRoot];
+        for (NSString *relative in walker)
+        {
+            if ([relative.pathExtension.lowercaseString isEqualToString:@"milk"])
+            {
+                [paths addObject:[presetsRoot stringByAppendingPathComponent:relative]];
+            }
+        }
         self.presetPaths = [paths sortedArrayUsingSelector:@selector(compare:)];
         NSLog(@"PresetValidate: found %lu bundled presets", static_cast<unsigned long>(self.presetPaths.count));
 
@@ -244,6 +256,29 @@ static void PresetSwitchFailedCallback(const char *presetFilename, const char *m
     {
         NSLog(@"PresetValidate: projectm_create failed");
         return NO;
+    }
+
+    // projectM drops log lines entirely when no callback is registered, so the
+    // validator previously lost every LOG_INFO/LOG_ERROR from preset loads. Route
+    // them to a pullable file sink (Library/Caches/preset-validator-projectm.log)
+    // so validator sweeps (e.g. the W4 ParseInputHash fidelity comparison) can be
+    // harvested headlessly. Validator builds only (this whole file is
+    // ROONVIS_ENABLE_PRESET_VALIDATOR-gated), single GL-thread writer.
+    {
+        NSString *logPath = [NSSearchPathForDirectoriesInDomains(NSCachesDirectory, NSUserDomainMask, YES).firstObject
+            stringByAppendingPathComponent:@"preset-validator-projectm.log"];
+        static FILE *sValidatorProjectMLog = nullptr;
+        sValidatorProjectMLog = fopen(logPath.fileSystemRepresentation, "w");
+        projectm_set_log_callback(
+            [](const char *message, projectm_log_level, void *) {
+                if (message != nullptr && sValidatorProjectMLog != nullptr)
+                {
+                    fputs(message, sValidatorProjectMLog);
+                    fputc('\n', sValidatorProjectMLog);
+                    fflush(sValidatorProjectMLog);
+                }
+            },
+            true, nullptr);
     }
 
     projectm_set_mesh_size(self.projectM, 48, 36);

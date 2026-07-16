@@ -13,6 +13,11 @@ typedef NS_ENUM(NSInteger, RoonVisPresetRotationMode) {
     RoonVisPresetRotationModeLoop = 0,
     RoonVisPresetRotationModeShuffle = 1,
     RoonVisPresetRotationModeFavorites = 2,
+    // Shuffles within the playing preset's top category (pack tree). The
+    // category follows the anchor preset; each category's order persists in
+    // its own scope of the scoped rotation-order store (never the global
+    // Shuffle scope "").
+    RoonVisPresetRotationModeCategory = 3,
 };
 
 FOUNDATION_EXPORT NSNotificationName const RoonVisSettingsDidChangeNotification;
@@ -60,6 +65,11 @@ FOUNDATION_EXPORT NSString *const RoonVisSettingsSnapcastServerHostKey;
 @property(nonatomic, copy) NSString *snapcastServerHost;
 @property(nonatomic, copy) NSSet<NSString *> *favoritePresetFilenames;
 @property(nonatomic, copy) NSSet<NSString *> *hiddenPresetFilenames;
+
+// Monotonically-increasing counter bumped whenever the favorite or hidden
+// filename sets change. Lets observers cheaply detect library-set mutations
+// (vs the scalar/string settings) without diffing the sets.
+@property(nonatomic, readonly) NSUInteger librarySetsRevision;
 
 + (instancetype)sharedSettings;
 + (void)registerDefaults;

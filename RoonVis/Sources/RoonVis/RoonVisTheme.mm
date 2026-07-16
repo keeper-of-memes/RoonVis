@@ -8,16 +8,6 @@
 
 namespace
 {
-static CGFloat RVClamp(CGFloat value, CGFloat minimum, CGFloat maximum)
-{
-    return std::max(minimum, std::min(maximum, value));
-}
-
-static void RVActivate(NSArray<NSLayoutConstraint *> *constraints)
-{
-    [NSLayoutConstraint activateConstraints:constraints];
-}
-
 static UIFont *RVSystemFont(CGFloat size, UIFontWeight regularWeight, UIFontWeight boldWeight)
 {
     return [UIFont systemFontOfSize:size weight:(UIAccessibilityIsBoldTextEnabled() ? boldWeight : regularWeight)];

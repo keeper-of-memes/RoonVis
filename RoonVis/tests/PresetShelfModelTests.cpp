@@ -136,8 +136,67 @@ void TestFlattenPresetShelfIndexesFollowsBrowseOrderWithoutDuplicates()
 
 }  // namespace
 
+
+namespace
+{
+
+void TestCategoryGroupedShelves()
+{
+    using namespace RoonVis;
+    std::vector<PresetShelfInput> inputs;
+    auto add = [&inputs](size_t index, const char *file, const char *cat, const char *sub, bool fav = false) {
+        PresetShelfInput input;
+        input.index = index;
+        input.filename = file;
+        input.title = file;
+        input.favorite = fav;
+        input.category = cat;
+        input.subcategory = sub;
+        inputs.push_back(input);
+    };
+    add(0, "a.milk", "Fractal", "Lattice");
+    add(1, "b.milk", "Fractal", "Lattice");
+    add(2, "c.milk", "Dancer", "Glowsticks");
+    add(3, "d.milk", "Fractal", "Organic");
+
+    auto shelves = BuildPresetShelves(inputs, false);
+    // One shelf per (category, subcategory), ordered by category then sub -
+    // no runtime tiny-sub merge (pack time owns <Top>/Other).
+    REQUIRE(shelves.size() == 3);
+    CHECK(shelves[0].category == "Dancer");
+    CHECK(shelves[0].title == "Glowsticks");
+    CHECK(shelves[0].indexes.size() == 1);
+    CHECK(shelves[1].category == "Fractal");
+    CHECK(shelves[1].title == "Lattice");
+    CHECK(shelves[1].indexes.size() == 2);
+    CHECK(shelves[2].title == "Organic");
+
+    // Favourites tab unchanged: single flat shelf regardless of categories.
+    inputs[2].favorite = true;
+    auto favShelves = BuildPresetShelves(inputs, true);
+    REQUIRE(favShelves.size() == 1);
+    CHECK(favShelves[0].title == "Favorites");
+
+    // No category metadata -> author clustering fallback still works.
+    std::vector<PresetShelfInput> plain;
+    for (size_t i = 0; i < 4; i++)
+    {
+        PresetShelfInput input;
+        input.index = i;
+        input.filename = "flexi_-_test_" + std::to_string(i) + ".milk";
+        input.title = input.filename;
+        plain.push_back(input);
+    }
+    auto authorShelves = BuildPresetShelves(plain, false);
+    REQUIRE(!authorShelves.empty());
+    CHECK(authorShelves[0].category.empty());
+}
+
+} // namespace
+
 void RunPresetShelfModelTests()
 {
+    TestCategoryGroupedShelves();
     TestAuthorClusterExtraction();
     TestShelvesFoldSmallClustersIntoOther();
     TestFavoritesNotDuplicatedAcrossShelves();

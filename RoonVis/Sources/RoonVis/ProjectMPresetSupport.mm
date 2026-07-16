@@ -9,12 +9,13 @@
 
 @implementation RoonVisPresetShelf
 
-- (instancetype)initWithTitle:(NSString *)title presetIndexes:(NSArray<NSNumber *> *)presetIndexes
+- (instancetype)initWithTitle:(NSString *)title category:(NSString *)category presetIndexes:(NSArray<NSNumber *> *)presetIndexes
 {
     self = [super init];
     if (self)
     {
         _title = [title copy];
+        _category = [category copy];
         _presetIndexes = [presetIndexes copy];
     }
     return self;
@@ -23,6 +24,7 @@
 - (void)dealloc
 {
     [_title release];
+    [_category release];
     [_presetIndexes release];
     [super dealloc];
 }

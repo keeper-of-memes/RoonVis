@@ -51,18 +51,21 @@ struct RVFocusRow<Control: View>: View {
     private let description: String?
     private let action: () -> Void
     private let control: Control
+    private let accessibilityIdentifier: String?
 
     init(
         systemImage: String? = nil,
         title: String,
         description: String? = nil,
         action: @escaping () -> Void = {},
+        accessibilityIdentifier: String? = nil,
         @ViewBuilder control: () -> Control
     ) {
         self.systemImage = systemImage
         self.title = title
         self.description = description
         self.action = action
+        self.accessibilityIdentifier = accessibilityIdentifier
         self.control = control()
     }
 
@@ -73,6 +76,7 @@ struct RVFocusRow<Control: View>: View {
             }
         }
         .buttonStyle(RVRowButtonStyle())
+        .modifier(RVOptionalIdentifier(accessibilityIdentifier.map { "row-\($0)" }))
     }
 }
 
@@ -162,19 +166,21 @@ struct RVToggleRow: View {
     let systemImage: String?
     let title: String
     let description: String?
+    let accessibilityIdentifier: String?
     @Binding var isOn: Bool
 
-    init(systemImage: String? = nil, title: String, description: String? = nil, isOn: Binding<Bool>) {
+    init(systemImage: String? = nil, title: String, description: String? = nil, accessibilityIdentifier: String? = nil, isOn: Binding<Bool>) {
         self.systemImage = systemImage
         self.title = title
         self.description = description
+        self.accessibilityIdentifier = accessibilityIdentifier
         _isOn = isOn
     }
 
     var body: some View {
         RVFocusRow(systemImage: systemImage, title: title, description: description, action: {
             isOn.toggle()
-        }) {
+        }, accessibilityIdentifier: accessibilityIdentifier) {
             RVSwitchVisual(isOn: isOn)
         }
         .accessibilityValue(isOn ? "On" : "Off")
@@ -209,6 +215,12 @@ struct RVSegmentRow: View {
     let description: String?
     let segments: [String]
     @Binding var selection: Int
+    // Optional stable identifier for UITests. When set: the row exposes
+    // `row-<identifier>`, each pill `pill-<identifier>-<segment-label-slug>`,
+    // and the row's `.accessibilityValue` reflects the selected segment's label.
+    // Additive only — labels are unchanged, so existing label-based tests still pass.
+    let accessibilityIdentifier: String?
+
     @FocusState private var focusedSegment: Int?
 
     init(
@@ -216,13 +228,15 @@ struct RVSegmentRow: View {
         title: String,
         description: String? = nil,
         segments: [String],
-        selection: Binding<Int>
+        selection: Binding<Int>,
+        accessibilityIdentifier: String? = nil
     ) {
         self.systemImage = systemImage
         self.title = title
         self.description = description
         self.segments = segments
         _selection = selection
+        self.accessibilityIdentifier = accessibilityIdentifier
     }
 
     var body: some View {
@@ -241,11 +255,14 @@ struct RVSegmentRow: View {
                     }
                     .buttonStyle(RVRowButtonStyle())   // suppress the tvOS system white focus frame
                     .focused($focusedSegment, equals: index)
+                    .modifier(RVOptionalIdentifier(accessibilityIdentifier.map { "pill-\($0)-\(RVSlug.make(segments[index]))" }))
                 }
             }
             .padding(4)
             .background(RVTheme.Colors.material, in: Capsule())
         }
+        .modifier(RVOptionalIdentifier(accessibilityIdentifier.map { "row-\($0)" }))
+        .modifier(RVOptionalAccessibilityValue(selectedSegmentLabel))
         .onChange(of: focusedSegment) { oldValue, newValue in
             guard let newValue else { return }
             // Focus ENTERING the row must never commit: tvOS lands on whichever
@@ -266,6 +283,62 @@ struct RVSegmentRow: View {
         .onChange(of: selection) {
             guard segments.indices.contains(selection), focusedSegment != selection else { return }
             focusedSegment = selection
+        }
+    }
+
+    // The currently-selected segment's label, exposed as the row's
+    // `.accessibilityValue` when an identifier is set (nil = no override).
+    // Lets a UITest read the live selection in-process (e.g. rotation mode).
+    private var selectedSegmentLabel: String? {
+        guard accessibilityIdentifier != nil, segments.indices.contains(selection) else { return nil }
+        return segments[selection]
+    }
+}
+
+/// Lowercase, hyphenated slug for building stable a11y identifiers from labels
+/// (e.g. "Instant cut" -> "instant-cut", "60" -> "60", "4K" -> "4k").
+enum RVSlug {
+    static func make(_ raw: String) -> String {
+        let lowered = raw.lowercased()
+        var out = ""
+        var lastWasHyphen = false
+        for ch in lowered {
+            if ch.isLetter || ch.isNumber {
+                out.append(ch)
+                lastWasHyphen = false
+            } else if !lastWasHyphen && !out.isEmpty {
+                out.append("-")
+                lastWasHyphen = true
+            }
+        }
+        if out.hasSuffix("-") { out.removeLast() }
+        return out
+    }
+}
+
+/// Applies `.accessibilityIdentifier` only when a non-nil id is provided, so
+/// call sites can opt in without changing behaviour when the id is absent.
+private struct RVOptionalIdentifier: ViewModifier {
+    let identifier: String?
+    init(_ identifier: String?) { self.identifier = identifier }
+    func body(content: Content) -> some View {
+        if let identifier {
+            content.accessibilityIdentifier(identifier)
+        } else {
+            content
+        }
+    }
+}
+
+/// Applies `.accessibilityValue` only when a non-nil value is provided.
+private struct RVOptionalAccessibilityValue: ViewModifier {
+    let value: String?
+    init(_ value: String?) { self.value = value }
+    func body(content: Content) -> some View {
+        if let value {
+            content.accessibilityValue(value)
+        } else {
+            content
         }
     }
 }
@@ -313,6 +386,7 @@ struct RVStepperRow: View {
     // Numeric values (e.g. "280 ms") read better monospaced; word values
     // (e.g. "Balanced") should use the regular menu font so they match the rest.
     let usesMonospacedValue: Bool
+    let accessibilityIdentifier: String?
 
     init(
         systemImage: String? = nil,
@@ -322,6 +396,7 @@ struct RVStepperRow: View {
         range: ClosedRange<Double>,
         step: Double,
         usesMonospacedValue: Bool = true,
+        accessibilityIdentifier: String? = nil,
         formatter: @escaping (Double) -> String
     ) {
         self.systemImage = systemImage
@@ -331,11 +406,12 @@ struct RVStepperRow: View {
         self.range = range
         self.step = step
         self.usesMonospacedValue = usesMonospacedValue
+        self.accessibilityIdentifier = accessibilityIdentifier
         self.formatter = formatter
     }
 
     var body: some View {
-        RVFocusRow(systemImage: systemImage, title: title, description: description) {
+        RVFocusRow(systemImage: systemImage, title: title, description: description, accessibilityIdentifier: accessibilityIdentifier) {
             HStack(spacing: 0) {
                 stepVisual(systemName: "chevron.left")
                 Text(formatter(value))
@@ -396,6 +472,7 @@ struct RVPillTabBar: View {
                 .buttonStyle(RVRowButtonStyle())   // suppress the tvOS system white focus frame
                 .focused(focusedTab, equals: index)
                 .prefersDefaultFocus(selection == index, in: tabFocusNamespace)
+                .accessibilityIdentifier("tab-\(RVSlug.make(tabs[index].title))")
             }
         }
         .padding(5)

@@ -49,7 +49,8 @@ struct RootChromeView: View {
                                     fps: diagnostics.fps,
                                     frameMs: diagnostics.frameTimeMs,
                                     presetIndex: engine.currentPresetIndex,
-                                    presetCount: engine.presetCount
+                                    presetCount: engine.presetCount,
+                                    droppedFrames: diagnostics.droppedFrames
                                 )
                                 .transition(.opacity)
                             }

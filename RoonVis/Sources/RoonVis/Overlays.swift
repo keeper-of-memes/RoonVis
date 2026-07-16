@@ -90,11 +90,20 @@ struct DiagnosticsHUDView: View {
     let frameMs: Double
     let presetIndex: Int
     let presetCount: Int
+    var droppedFrames: Int = 0
 
     var body: some View {
         VStack(alignment: .leading, spacing: RVTheme.Spacing.xs) {
-            diagnosticsRow(label: "FPS:", value: String(format: "%.0f", fps), valueColor: fps >= 59.0 ? RVTheme.Colors.primaryText : .orange)
+            // Live-sampled fps (0.5s poll window). The >=59 orange threshold was
+            // wrong on 50Hz panels; compare against nothing absolute here — the
+            // panel cap varies (25/30/50/60 seen across devices/modes).
+            diagnosticsRow(label: "FPS:", value: String(format: "%.0f", fps), valueColor: RVTheme.Colors.primaryText)
+                .accessibilityIdentifier("diagnostics.fps")
+                .accessibilityValue(String(format: "%.0f", fps))
             diagnosticsRow(label: "Frame time:", value: String(format: "%.1fms", frameMs), valueColor: RVTheme.Colors.primaryText)
+            diagnosticsRow(label: "Dropped:", value: "\(droppedFrames)", valueColor: droppedFrames > 0 ? .orange : RVTheme.Colors.primaryText)
+                .accessibilityIdentifier("diagnostics.dropped")
+                .accessibilityValue("\(droppedFrames)")
             diagnosticsRow(label: "Preset:", value: presetText, valueColor: RVTheme.Colors.primaryText)
         }
         .padding(.horizontal, RVTheme.Spacing.m)

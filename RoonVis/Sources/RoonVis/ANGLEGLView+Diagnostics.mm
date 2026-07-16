@@ -3,6 +3,7 @@
 #import "ProjectMBridgeInternal.h"
 #import "RoonVisCrashReporter.h"
 #import "RoonVisPerfCounters.h"
+#import "RoonVisPerfDiagnosticsSink.h"
 
 #import <EGL/eglext.h>
 
@@ -94,6 +95,16 @@ static NSInteger RoonVisDisplayRefreshRate(UIView *view)
     NSInteger refreshRate = screen.maximumFramesPerSecond;
     return refreshRate > 0 ? refreshRate : 60;
 }
+}
+
+// Exported wrapper over the file-static sink helper so other translation units
+// (ProjectMBridge's FixedRotation resolve / Thermal breadcrumbs) can force-write
+// campaign-critical lines exactly the way the CompatBurnIn lines below do
+// (perfDiagnosticsEnabled=YES bypasses the enabled/env gate). Declared in
+// RoonVisPerfDiagnosticsSink.h.
+extern "C" void RoonVisPerfDiagnosticsSinkAppendLine(NSString *line)
+{
+    RoonVisAppendPerfDiagnosticsLine(line, YES);
 }
 
 #pragma clang diagnostic push
@@ -303,7 +314,7 @@ static NSInteger RoonVisDisplayRefreshRate(UIView *view)
     EGLint programCacheEntries = _angleProgramCacheControlAvailable ? eglProgramCacheGetAttribANGLE(self.eglDisplay, EGL_PROGRAM_CACHE_SIZE_ANGLE) : -1;
     _diagnosticsFPS = avgFps;
     _diagnosticsFrameTimeMs = avgRenderMs;
-    NSString *perfDiagLine = [NSString stringWithFormat:@"PerfDiag: fps=%.1f successful=%lu skipped=%lu interval avg/min/max=%.2f/%.2f/%.2fms render avg/max=%.2f/%.2fms swap avg/max=%.2f/%.2fms AVLatency: buffer=%ldms render=%.2fms swap=%.2fms display=%.2fms total=%.2fms (+TV panel lag, measure externally) swapFailures=%lu makeCurrentFailures=%lu programCacheEntries=%d preset confirmed=%@ requested=%@",
+    NSString *perfDiagLine = [NSString stringWithFormat:@"PerfDiag: fps=%.1f successful=%lu skipped=%lu interval avg/min/max=%.2f/%.2f/%.2fms render avg/max=%.2f/%.2fms swap avg/max=%.2f/%.2fms AVLatency: buffer=%ldms render=%.2fms swap=%.2fms display=%.2fms total=%.2fms (+TV panel lag, measure externally) swapFailures=%lu makeCurrentFailures=%lu programCacheEntries=%d transpileCache=%lu/%lu preset confirmed=%@ requested=%@",
           avgFps,
           static_cast<unsigned long>(_perfSuccessfulRenderedFrames),
           static_cast<unsigned long>(_perfSkippedFrames),
@@ -322,6 +333,8 @@ static NSInteger RoonVisDisplayRefreshRate(UIView *view)
           static_cast<unsigned long>(_perfSwapFailures),
           static_cast<unsigned long>(_perfMakeCurrentFailures),
           programCacheEntries,
+          static_cast<unsigned long>(self.projectMBridge.transpileCacheHits),
+          static_cast<unsigned long>(self.projectMBridge.transpileCacheMisses),
           confirmedPreset,
           requestedPreset];
     NSLog(@"%@", perfDiagLine);
@@ -330,6 +343,221 @@ static NSInteger RoonVisDisplayRefreshRate(UIView *view)
     [self resetPerformanceDiagnostics];
     _diagnosticsFPS = avgFps;
     _diagnosticsFrameTimeMs = avgRenderMs;
+}
+
+// Compat burn-in ground truth (Phase 4 of the compat scan): one line per
+// preset at dwell end with the max render time seen, so predictions can be
+// joined against real outcomes. PerfDiag's 5-second windows cannot provide
+// this. Diagnostic builds only; enabled via ROONVIS_COMPAT_BURNIN=1. Presets
+// that never confirm produce NO line - the join script counts absence as
+// loadFail (the same absence rule the original HD burn-in used).
+#if ROONVIS_ENABLE_DIAGNOSTIC_MODES
+static BOOL RoonVisCompatBurnInEnabled()
+{
+    static BOOL enabled = NSProcessInfo.processInfo.environment[@"ROONVIS_COMPAT_BURNIN"].boolValue;
+    return enabled;
+}
+
+// W2 steady-state extension (ROONVIS_COMPAT_BURNIN_STEADY, requires COMPAT_BURNIN):
+// per-preset render-time DISTRIBUTION over the settled window (first
+// kCompatSteadySettleSeconds of each dwell skipped — that window holds the one-time
+// shader-compile spike that the plain maxRenderMs outcome is dominated by). The D1
+// ship gate (p95 <= budget, over-budget rate, sample floor) is applied OFFLINE by
+// the join script; the app only reports evidence. File-static rather than ivars:
+// diagnostics-only mode, exactly one ANGLEGLView instance exists (composition
+// root), and the per-dwell Reset makes any theoretical stale state self-correct
+// after one preset switch.
+static BOOL RoonVisCompatBurnInSteadyEnabled()
+{
+    static BOOL enabled =
+        NSProcessInfo.processInfo.environment[@"ROONVIS_COMPAT_BURNIN_STEADY"].boolValue;
+    return enabled;
+}
+
+namespace
+{
+constexpr double kCompatSteadySettleSeconds = 3.0;
+// 1 ms bins; the last bin absorbs everything >= (kCompatSteadyBinCount-1) ms. A
+// 511 ms+ settled frame is far past catastrophic, so overflow precision is moot.
+constexpr size_t kCompatSteadyBinCount = 512;
+
+struct CompatSteadyStats
+{
+    uint32_t bins[kCompatSteadyBinCount];
+    uint32_t samples;
+    uint32_t overBudget; // settled frames > 1x frame budget
+    uint32_t over2x;     // settled frames > the slow threshold (2x frame, >=80ms floor)
+    double maxSeconds;
+    CFTimeInterval dwellStart;
+
+    void Reset(CFTimeInterval now)
+    {
+        memset(bins, 0, sizeof(bins));
+        samples = 0;
+        overBudget = 0;
+        over2x = 0;
+        maxSeconds = 0.0;
+        dwellStart = now;
+    }
+
+    void Record(double seconds, double budgetSeconds, double slowSeconds)
+    {
+        size_t bin = static_cast<size_t>(seconds * 1000.0);
+        bin = std::min(bin, kCompatSteadyBinCount - 1);
+        bins[bin]++;
+        samples++;
+        if (seconds > budgetSeconds)
+        {
+            overBudget++;
+        }
+        if (seconds > slowSeconds)
+        {
+            over2x++;
+        }
+        maxSeconds = std::max(maxSeconds, seconds);
+    }
+
+    // q in (0,1]; returns the bin upper edge in ms of the ceil(q*samples)-th
+    // ordered sample (1 ms resolution — ample for a 40 ms budget gate).
+    double PercentileMs(double q) const
+    {
+        if (samples == 0)
+        {
+            return 0.0;
+        }
+        const uint64_t rank = static_cast<uint64_t>(std::ceil(q * samples));
+        uint64_t seen = 0;
+        for (size_t i = 0; i < kCompatSteadyBinCount; i++)
+        {
+            seen += bins[i];
+            if (seen >= rank)
+            {
+                return static_cast<double>(i + 1);
+            }
+        }
+        return static_cast<double>(kCompatSteadyBinCount);
+    }
+};
+
+CompatSteadyStats gCompatSteady; // zero-initialized (static storage)
+} // namespace
+#endif
+
+- (void)recordCompatBurnInPreset:(NSString *)presetName renderDuration:(CFTimeInterval)renderDuration slowThreshold:(CFTimeInterval)slowThresholdSeconds frameBudget:(CFTimeInterval)frameBudgetSeconds
+{
+#if ROONVIS_ENABLE_DIAGNOSTIC_MODES
+    if (!RoonVisCompatBurnInEnabled() || presetName.length == 0)
+    {
+        return;
+    }
+    const CFTimeInterval now = CACurrentMediaTime();
+    if (_compatBurnInPresetName != nil && ![_compatBurnInPresetName isEqualToString:presetName])
+    {
+        const char *outcome = "pass";
+        if (_compatBurnInMaxRenderSeconds >= kCatastrophicPresetRenderSeconds)
+        {
+            outcome = "catastrophic";
+        }
+        else if (_compatBurnInMaxRenderSeconds > slowThresholdSeconds)
+        {
+            outcome = "slow";
+        }
+        RoonVisAppendPerfDiagnosticsLine(
+            [NSString stringWithFormat:@"CompatBurnIn: preset=%@ maxRenderMs=%.1f outcome=%s audio=%s",
+                                       _compatBurnInPresetName,
+                                       _compatBurnInMaxRenderSeconds * 1000.0, outcome,
+                                       self.projectMBridge.isLivePCMActive ? "live" : "wav"],
+            YES);
+        if (RoonVisCompatBurnInSteadyEnabled())
+        {
+            // Settled-window distribution for the outgoing preset. samples=0 means
+            // the dwell never outlived the settle skip - the join script treats
+            // that as insufficient evidence, never as a pass.
+            RoonVisAppendPerfDiagnosticsLine(
+                [NSString stringWithFormat:
+                              @"CompatBurnInSteady: preset=%@ samples=%u p50Ms=%.0f p95Ms=%.0f "
+                              @"p99Ms=%.0f maxMs=%.1f overBudget=%u over2x=%u budgetMs=%.1f",
+                              _compatBurnInPresetName,
+                              gCompatSteady.samples,
+                              gCompatSteady.PercentileMs(0.50),
+                              gCompatSteady.PercentileMs(0.95),
+                              gCompatSteady.PercentileMs(0.99),
+                              gCompatSteady.maxSeconds * 1000.0,
+                              gCompatSteady.overBudget,
+                              gCompatSteady.over2x,
+                              frameBudgetSeconds * 1000.0],
+                YES);
+        }
+        _compatBurnInMaxRenderSeconds = 0;
+    }
+    if (_compatBurnInPresetName == nil || ![_compatBurnInPresetName isEqualToString:presetName])
+    {
+        [_compatBurnInPresetName release];
+        _compatBurnInPresetName = [presetName copy];
+        _compatBurnInMaxRenderSeconds = 0;
+        gCompatSteady.Reset(now);
+    }
+    _compatBurnInMaxRenderSeconds = MAX(_compatBurnInMaxRenderSeconds, renderDuration);
+    if (RoonVisCompatBurnInSteadyEnabled() &&
+        (now - gCompatSteady.dwellStart) >= kCompatSteadySettleSeconds)
+    {
+        gCompatSteady.Record(renderDuration, frameBudgetSeconds, slowThresholdSeconds);
+    }
+#else
+    (void)presetName;
+    (void)renderDuration;
+    (void)slowThresholdSeconds;
+    (void)frameBudgetSeconds;
+#endif
+}
+
+// Live HUD sampler (RC feedback): runs unconditionally per completed frame on
+// the GL thread. The old HUD read the 5s diagnostics window, so after toggling
+// the overlay it showed 0 for up to 5s and then a 5s-stale average - "the fps
+// counter doesn't work". This path is window-free.
+- (void)recordHUDFrameAtTime:(CFTimeInterval)now renderedFrame:(BOOL)rendered
+{
+    _hudFrameCount++;
+    if (_hudSampleStartTime <= 0)
+    {
+        _hudSampleStartTime = now;
+    }
+    const NSInteger effectiveRate = RoonVisEffectiveFrameRate(self);
+    const CFTimeInterval target = effectiveRate > 0 ? 1.0 / static_cast<CFTimeInterval>(effectiveRate) : 1.0 / 60.0;
+    if (_hudLastFrameTime > 0)
+    {
+        const CFTimeInterval interval = now - _hudLastFrameTime;
+        if (!rendered || interval > target * 1.5)
+        {
+            _hudDroppedFrames++;
+        }
+    }
+    _hudLastFrameTime = now;
+    const NSInteger presetIndex = self.projectMBridge.currentPresetIndex;
+    if (presetIndex != _hudDropPresetIndex)
+    {
+        _hudDropPresetIndex = presetIndex;
+        _hudDroppedFrames = 0;
+    }
+}
+
+- (double)hudCurrentFPS
+{
+    const CFTimeInterval now = CACurrentMediaTime();
+    const CFTimeInterval elapsed = now - _hudSampleStartTime;
+    if (_hudSampleStartTime <= 0 || elapsed <= 0)
+    {
+        return 0.0;
+    }
+    const double fps = static_cast<double>(_hudFrameCount) / elapsed;
+    _hudFrameCount = 0;
+    _hudSampleStartTime = now;
+    return fps;
+}
+
+- (NSUInteger)droppedFramesSincePresetChange
+{
+    return _hudDroppedFrames;
 }
 
 - (void)recordPresetRenderDuration:(CFTimeInterval)renderDuration
@@ -341,6 +569,7 @@ static NSInteger RoonVisDisplayRefreshRate(UIView *view)
     const CFTimeInterval frameDuration = effectiveFrameRate > 0 ? 1.0 / static_cast<CFTimeInterval>(effectiveFrameRate) : 1.0 / 60.0;
     const CFTimeInterval slowThresholdSeconds = MAX(kSlowPresetRenderSeconds, 2.0 * frameDuration);
     NSString *presetName = self.projectMBridge.confirmedPresetName ?: self.projectMBridge.requestedPresetName ?: @"";
+    [self recordCompatBurnInPreset:presetName renderDuration:renderDuration slowThreshold:slowThresholdSeconds frameBudget:frameDuration];
     if ([self.projectMBridge consumeWarmedFirstActivationForPresetName:presetName])
     {
         _slowPresetFrameCount = 0;

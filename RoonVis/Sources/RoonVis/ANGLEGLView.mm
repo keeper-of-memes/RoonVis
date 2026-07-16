@@ -1,5 +1,10 @@
 #import "ANGLEGLViewInternal.h"
 
+// Deliberate category split (+Controls/+Diagnostics): methods declared in the class
+// extension are defined there, which this file's @implementation cannot see — a
+// structural false positive (the linker catches genuinely missing definitions).
+#pragma clang diagnostic ignored "-Wincomplete-implementation"
+
 #import "ProjectMBridgeInternal.h"
 #import "PresetWarmSettings.h"
 #import "RoonVisCrashReporter.h"
@@ -7,6 +12,7 @@
 #import "RoonVisPerfCounters.h"
 #import "RoonVisSettings.h"
 #import "RoonVis-Swift.h"
+#import "ShaderBlobCacheAdapter.h"
 #import "SnapcastClient.h"
 
 #import <QuartzCore/CAMetalLayer.h>
@@ -278,8 +284,24 @@ static BOOL RoonVisDisableSlowPresetSkip()
         uint16_t snapcastPort = snapcastPortNumber != nil ? static_cast<uint16_t>(snapcastPortNumber.unsignedShortValue) : 1704;
         _appliedSnapcastHost = [snapcastHost copy];
         _appliedSnapcastPort = snapcastPort;
+#if ROONVIS_ENABLE_DIAGNOSTIC_MODES
+        // Burn-in hook: force the bundled slip.wav fallback. The snapserver's
+        // idle stream is SILENCE (send_silence=true), and slow-preset cost is
+        // audio-dependent - a silent burn-in under-triggers the very failures
+        // being measured. Skipping the client entirely makes the bridge feed
+        // real audio content from the WAV.
+        if (NSProcessInfo.processInfo.environment[@"ROONVIS_DISABLE_SNAPCAST"].boolValue)
+        {
+            RoonVisLog(@"Snapcast disabled by ROONVIS_DISABLE_SNAPCAST (WAV fallback burn-in)");
+        }
+        else
+        {
+#endif
         self.snapcastClient = [[[SnapcastClient alloc] initWithHost:snapcastHost port:snapcastPort bridge:self.projectMBridge] autorelease];
         [self.snapcastClient start];
+#if ROONVIS_ENABLE_DIAGNOSTIC_MODES
+        }
+#endif
         [[NSNotificationCenter defaultCenter] addObserver:self
                                                  selector:@selector(screenModeDidChange:)
                                                      name:UIScreenModeDidChangeNotification
@@ -289,8 +311,16 @@ static BOOL RoonVisDisableSlowPresetSkip()
                                                      name:RoonVisSettingsDidChangeNotification
                                                    object:[RoonVisSettings sharedSettings]];
         [self installOverlayViews];
+        // CADisplayLink retains its target, so this cycle pins the view (and dealloc's
+        // teardown is unreachable) — intentional for an app-lifetime composition root.
+        // If view recreation is ever added, switch to a weak-proxy target or the old view
+        // + EGL context leak silently.
         self.displayLink = [CADisplayLink displayLinkWithTarget:self selector:@selector(drawFrame)];
         [self applyDisplayTimingToDisplayLink];
+        // Keep projectM's fps hint paired with every display-timing (re)apply (W0:
+        // the hint no longer rides on -resizeToDrawableSize:). Redundant with the
+        // bridge's own init-time projectm_set_fps, but keeps the pairing uniform.
+        [self.projectMBridge refreshProjectMFPSHint];
         [self.displayLink addToRunLoop:NSRunLoop.mainRunLoop forMode:NSRunLoopCommonModes];
         RoonVisLog(@"Render loop start");
     }
@@ -354,16 +384,25 @@ static BOOL RoonVisDisableSlowPresetSkip()
         return;
     }
     CAMetalLayer *metalLayer = (CAMetalLayer *)self.layer;
+    // W0: only redraw when this call actually changes something — the surface is
+    // missing or its size differs from the target (about to be recreated below).
+    // A same-size re-apply (layout pass, bulk settings post) must not schedule an
+    // extra out-of-band frame.
+    const BOOL drawableChanged = (self.eglSurface == EGL_NO_SURFACE ||
+                                  !CGSizeEqualToSize(targetDrawableSize, self.surfaceDrawableSize));
     const CGFloat scale = targetDrawableSize.width / 1920.0;
     self.contentScaleFactor = scale;
     metalLayer.contentsScale = scale;
     metalLayer.drawableSize = targetDrawableSize;
-    if (![self recreateSurfaceIfNeededForDrawableSize:targetDrawableSize])
+    if (![self ensureSurfaceForDrawableSize:targetDrawableSize])
     {
         return;
     }
     [self.projectMBridge resizeToDrawableSize:targetDrawableSize];
-    [self drawFrame];
+    if (drawableChanged)
+    {
+        [self drawFrame];
+    }
 }
 
 // Restarts the Snapcast client when the user changes the server host. A no-op
@@ -387,6 +426,9 @@ static BOOL RoonVisDisableSlowPresetSkip()
 - (void)screenModeDidChange:(NSNotification *)notification
 {
     [self applyDisplayTimingToDisplayLink];
+    // The panel rate is an input to the effective fps, and the resize below no
+    // longer re-derives the hint (W0) — refresh it explicitly with the link rate.
+    [self.projectMBridge refreshProjectMFPSHint];
     RoonVisLog(@"ANGLE display mode changed: fps=%ld",
                static_cast<long>(RoonVisEffectiveFrameRate(self)));
     [self applyDrawableConfiguration];
@@ -504,8 +546,13 @@ static BOOL RoonVisDisableSlowPresetSkip()
     // idle check every frame and warming would never run.
     const NSInteger effectiveFrameRate = RoonVisEffectiveFrameRate(self);
     CFTimeInterval targetFrameInterval = effectiveFrameRate > 0 ? 1.0 / static_cast<CFTimeInterval>(effectiveFrameRate) : frameInterval;
-    BOOL canWarmNow = [self.projectMBridge canWarmPresetAtTime:now];
-    if (!canWarmNow)
+    // A5: the ready-gate + candidate come from the bridge's event-computed warm dwell plan
+    // (one time comparison), replacing the per-frame canWarmPresetAtTime window math and the
+    // per-frame presetWarmCandidatesWithDepth rotation walk. The idle-budget gate below stays
+    // the driver's second condition, and the PresetWarmCache policy is unchanged.
+    RoonVis::PresetWarmCandidate planCandidate;
+    BOOL warmReady = [self.projectMBridge dwellPlanWarmCandidateReadyAtTime:now candidate:&planCandidate];
+    if (!warmReady)
     {
         _presetIdleWarmBudget.RecordFrame(frameInterval,
                                           targetFrameInterval,
@@ -528,9 +575,7 @@ static BOOL RoonVisDisableSlowPresetSkip()
     RoonVis::PresetWarmCandidate candidate = _presetWarmCache.InFlightCandidate();
     if (!RoonVis::PresetWarmCandidateIsValid(candidate))
     {
-        std::vector<RoonVis::PresetWarmCandidate> candidates =
-            [self.projectMBridge presetWarmCandidatesWithDepth:1 includePreloadAttempt:YES];
-        candidate = _presetWarmCache.ChooseNextCandidate(candidates);
+        candidate = _presetWarmCache.ChooseNextCandidate({planCandidate});
         if (!RoonVis::PresetWarmCandidateIsValid(candidate))
         {
             return;
@@ -549,21 +594,50 @@ static BOOL RoonVisDisableSlowPresetSkip()
     _presetWarmCache.MarkWarmFinished(candidate.index, candidate.path, success ? true : false);
 }
 
+// W0 settings routing: scope the work to the notification's changed key (guardrail #3 —
+// never invalidate globally for an unrelated key). RoonVisSettings posts userInfo
+// @{@"key": <changed key>} from every setter; a nil key (programmatic/bulk post) falls
+// through every branch, preserving the historical apply-everything behavior.
 - (void)settingsDidChange:(NSNotification *)notification
 {
-    _perfDiagnosticsEnabled = RoonVisPerfDiagnosticsEnabled();
-    RoonVisPerfCountersSetEnabled(_perfDiagnosticsEnabled);
-    _disableSlowPresetSkip = RoonVisDisableSlowPresetSkip();
-    [self applyPresetWarmCacheSettings];
-    // Frame-rate cap and render-size preset take effect live: re-apply the
-    // display link rate and the drawable configuration (the latter is a no-op
-    // recreate when the size is unchanged).
-    [self applyDisplayTimingToDisplayLink];
-    [self applyDrawableConfiguration];
-    [self applySnapcastHostSetting];
-    if ([RoonVisSettings sharedSettings].diagnosticsOverlayEnabled)
+    NSString *changedKey = notification.userInfo[@"key"];
+
+    // Diagnostics key -> refresh the ivar-cached diagnostic flags and restart the
+    // diagnostics window. (RoonVisPerfDiagnosticsEnabled reads the overlay setting in
+    // Release; the raw-defaults/env inputs of both flags have no RoonVisSettings key,
+    // so the bulk path is their only refresh — as before.)
+    if (changedKey == nil || [changedKey isEqualToString:RoonVisSettingsDiagnosticsOverlayEnabledKey])
     {
-        [self resetPerformanceDiagnostics];
+        _perfDiagnosticsEnabled = RoonVisPerfDiagnosticsEnabled();
+        RoonVisPerfCountersSetEnabled(_perfDiagnosticsEnabled);
+        _disableSlowPresetSkip = RoonVisDisableSlowPresetSkip();
+        if ([RoonVisSettings sharedSettings].diagnosticsOverlayEnabled)
+        {
+            [self resetPerformanceDiagnostics];
+        }
+    }
+    // Warm-cache settings (env / raw defaults) have no RoonVisSettings key today, so
+    // only the bulk path can re-apply them — routing them off per-key notifications
+    // is behavior-preserving (no in-app setter exists).
+    if (changedKey == nil)
+    {
+        [self applyPresetWarmCacheSettings];
+    }
+    // Frame-rate cap -> display link rate + projectM's fps hint (decoupled from resize).
+    if (changedKey == nil || [changedKey isEqualToString:RoonVisSettingsFrameRateCapKey])
+    {
+        [self applyDisplayTimingToDisplayLink];
+        [self.projectMBridge refreshProjectMFPSHint];
+    }
+    // Render-size preset -> drawable configuration (surface + bridge resize).
+    if (changedKey == nil || [changedKey isEqualToString:RoonVisSettingsDrawableSizePresetKey])
+    {
+        [self applyDrawableConfiguration];
+    }
+    // Snapcast host -> client restart (itself a no-op when the host is unchanged).
+    if (changedKey == nil || [changedKey isEqualToString:RoonVisSettingsSnapcastServerHostKey])
+    {
+        [self applySnapcastHostSetting];
     }
 }
 
@@ -688,6 +762,7 @@ static BOOL RoonVisDisableSlowPresetSkip()
     [_browseController release];
     [_quickSettingsController release];
     [_presetOptionsController release];
+    [_syncCalibrationController release];
     [_slowPresetName release];
     [_wouldSkipSlowPresetNames release];
     [_lastDiagnosticPresetName release];
@@ -712,6 +787,10 @@ static BOOL RoonVisDisableSlowPresetSkip()
         RoonVisLog(@"ANGLE Step A eglInitialize failed: 0x%04x", eglGetError());
         return NO;
     }
+
+    // Tier-2 persistent shader blob cache (once per process; setupEGL re-runs on
+    // surface recreation and a second eglSetBlobCacheFuncsANDROID call is an EGL error).
+    [ShaderBlobCacheAdapter registerWithEGLDisplayOnce:self.eglDisplay];
 
     const bool programCacheControlAvailable = EGLDisplayExtensionAvailable(self.eglDisplay, "EGL_ANGLE_program_cache_control");
     _angleProgramCacheControlAvailable = programCacheControlAvailable ? YES : NO;
@@ -813,14 +892,17 @@ static BOOL RoonVisDisableSlowPresetSkip()
     return YES;
 }
 
-- (BOOL)recreateSurfaceIfNeededForDrawableSize:(CGSize)drawableSize
+- (BOOL)ensureSurfaceForDrawableSize:(CGSize)drawableSize
 {
     if (drawableSize.width <= 0 || drawableSize.height <= 0)
     {
         return NO;
     }
 
-    if (CGSizeEqualToSize(drawableSize, self.surfaceDrawableSize))
+    // A surface is valid IFF eglSurface != EGL_NO_SURFACE. surfaceDrawableSize is only a
+    // "current size" note, so the fast path must confirm the surface actually exists —
+    // otherwise a lost surface with a stale size note dead-ends here (Finding 4).
+    if (self.eglSurface != EGL_NO_SURFACE && CGSizeEqualToSize(drawableSize, self.surfaceDrawableSize))
     {
         return YES;
     }
@@ -830,12 +912,50 @@ static BOOL RoonVisDisableSlowPresetSkip()
         return NO;
     }
 
+#if ROONVIS_ENABLE_DIAGNOSTIC_MODES
+    // Fault-injection hook (dev/QA only): ROONVIS_EGL_FAULT_INJECT = "destroy" or "create"
+    // forces the corresponding recreate failure branch EXACTLY ONCE (one-shot ivar flag),
+    // so a sim run can demonstrate that a single failed recreate no longer dead-ends into a
+    // permanent black screen. Compile-gated out of Release.
+    static BOOL sEGLFaultDestroyPending = NO;
+    static BOOL sEGLFaultCreatePending = NO;
+    static BOOL sEGLFaultResolved = NO;
+    if (!sEGLFaultResolved)
+    {
+        sEGLFaultResolved = YES;
+        NSString *fault = NSProcessInfo.processInfo.environment[@"ROONVIS_EGL_FAULT_INJECT"];
+        if ([fault isEqualToString:@"destroy"])
+        {
+            sEGLFaultDestroyPending = YES;
+            RoonVisLog(@"ANGLE Step A EGL fault-inject armed: destroy (ROONVIS_EGL_FAULT_INJECT)");
+        }
+        else if ([fault isEqualToString:@"create"])
+        {
+            sEGLFaultCreatePending = YES;
+            RoonVisLog(@"ANGLE Step A EGL fault-inject armed: create (ROONVIS_EGL_FAULT_INJECT)");
+        }
+    }
+#endif
+
     if (self.eglSurface == EGL_NO_SURFACE)
     {
         self.eglSurface = eglCreateWindowSurface(self.eglDisplay, self.eglConfig, (__bridge EGLNativeWindowType)self.layer, nullptr);
+#if ROONVIS_ENABLE_DIAGNOSTIC_MODES
+        if (sEGLFaultCreatePending)
+        {
+            sEGLFaultCreatePending = NO;
+            RoonVisLog(@"ANGLE Step A EGL fault-inject firing: create failure (one-shot)");
+            if (self.eglSurface != EGL_NO_SURFACE)
+            {
+                eglDestroySurface(self.eglDisplay, self.eglSurface);
+            }
+            self.eglSurface = EGL_NO_SURFACE;
+        }
+#endif
         if (self.eglSurface == EGL_NO_SURFACE)
         {
             RoonVisLog(@"ANGLE Step A recreate eglCreateWindowSurface failed: 0x%04x", eglGetError());
+            self.surfaceDrawableSize = CGSizeZero;
             return NO;
         }
         self.surfaceDrawableSize = drawableSize;
@@ -851,10 +971,21 @@ static BOOL RoonVisDisableSlowPresetSkip()
         }
 
         EGLBoolean destroyed = eglDestroySurface(self.eglDisplay, oldSurface);
+#if ROONVIS_ENABLE_DIAGNOSTIC_MODES
+        if (sEGLFaultDestroyPending)
+        {
+            sEGLFaultDestroyPending = NO;
+            RoonVisLog(@"ANGLE Step A EGL fault-inject firing: destroy failure (one-shot)");
+            destroyed = EGL_FALSE;
+        }
+#endif
         if (!destroyed)
         {
             RoonVisLog(@"ANGLE Step A recreate eglDestroySurface failed: 0x%04x", eglGetError());
             self.eglSurface = EGL_NO_SURFACE;
+            // The old surface is gone; the size note must not survive it, or the fast path
+            // above (were it size-only) could early-return a dead surface (Finding 4).
+            self.surfaceDrawableSize = CGSizeZero;
             return NO;
         }
 
@@ -878,13 +1009,18 @@ static BOOL RoonVisDisableSlowPresetSkip()
     RoonVisLog(@"ANGLE Step A recreated EGL surface %.0fx%.0f", drawableSize.width, drawableSize.height);
     [self resetPerformanceDiagnostics];
     [self resetPresetWarmCacheState];
+    // W0: a genuine recreation drops the bridge's compiled preload slot even at an
+    // unchanged size (where -resizeToDrawableSize:'s guard skips its dwell recompute),
+    // so force the recompute here. This also covers the swap-failure recovery path,
+    // which recreates the surface without ever calling resize.
+    [self.projectMBridge noteEGLSurfaceRecreated];
     return YES;
 }
 
 // Recovery path for sustained eglSwapBuffers failures (as opposed to a drawable-size
-// change). Forces -recreateSurfaceIfNeededForDrawableSize: past its size-equality
-// early-return by clearing the cached size, so the invalid surface is destroyed and
-// rebuilt at the same size. On success the consecutive-failure counter is cleared.
+// change). Forces -ensureSurfaceForDrawableSize: past its size-equality early-return by
+// clearing the cached size, so the invalid surface is destroyed and rebuilt at the same
+// size. On success the consecutive-failure and no-surface-retry counters are cleared.
 - (void)recreateEGLSurfaceAfterSwapFailure
 {
     CGSize drawableSize = ((CAMetalLayer *)self.layer).drawableSize;
@@ -895,9 +1031,10 @@ static BOOL RoonVisDisableSlowPresetSkip()
     NSLog(@"ANGLE Step A recovering from %lu consecutive swap failures: recreating EGL surface",
           static_cast<unsigned long>(_consecutiveSwapFailures));
     self.surfaceDrawableSize = CGSizeZero;
-    if ([self recreateSurfaceIfNeededForDrawableSize:drawableSize])
+    if ([self ensureSurfaceForDrawableSize:drawableSize])
     {
         _consecutiveSwapFailures = 0;
+        _surfaceRecoveryAttemptCounter = 0;
         NSLog(@"ANGLE Step A swap-failure recovery: EGL surface recreated");
     }
     else
@@ -952,8 +1089,21 @@ static BOOL RoonVisDisableSlowPresetSkip()
             _perfSkippedFrames++;
             [self logPerformanceDiagnosticsIfNeededAtTime:CACurrentMediaTime()];
         }
+        // No surface: the swap-failure recovery at the bottom of drawFrame never runs
+        // (we return before eglSwapBuffers), so drive recovery from here instead —
+        // throttled to every kSwapFailureRecoveryThreshold-th skipped frame so a
+        // genuinely dead display doesn't thrash (Finding 4 dead-end fix).
+        _surfaceRecoveryAttemptCounter++;
+        if ((_surfaceRecoveryAttemptCounter % kSwapFailureRecoveryThreshold) == 0)
+        {
+            NSLog(@"ANGLE Step A no-surface recovery retry (skipped=%lu): recreating EGL surface",
+                  static_cast<unsigned long>(_surfaceRecoveryAttemptCounter));
+            [self recreateEGLSurfaceAfterSwapFailure];
+        }
         return;
     }
+    // Surface is valid: clear the no-surface retry throttle so a future loss starts fresh.
+    _surfaceRecoveryAttemptCounter = 0;
 
     EGLBoolean madeCurrent = eglMakeCurrent(self.eglDisplay, self.eglSurface, self.eglSurface, self.eglContext);
     if (!madeCurrent)
@@ -1034,6 +1184,7 @@ static BOOL RoonVisDisableSlowPresetSkip()
         return;
     }
     _consecutiveSwapFailures = 0;
+    [self recordHUDFrameAtTime:swapEnd renderedFrame:renderedProjectMFrame];
     double renderDuration = static_cast<double>(renderEnd - renderStart);
     double swapDuration = static_cast<double>(swapEnd - swapStart);
     if (renderedProjectMFrame)

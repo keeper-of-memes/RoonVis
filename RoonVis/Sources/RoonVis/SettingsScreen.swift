@@ -33,6 +33,7 @@ struct SettingsScreenView: View {
                         value: rotationIntervalBinding,
                         range: SettingsRanges.rotationInterval,
                         step: SettingsRanges.rotationIntervalStep,
+                        accessibilityIdentifier: "rotation-interval",
                         formatter: formatMinutes
                     )
 
@@ -40,8 +41,9 @@ struct SettingsScreenView: View {
                         systemImage: "arrow.triangle.2.circlepath",
                         title: "Preset Rotation",
                         description: "Choose how automatic and remote preset changes move through Browse.",
-                        segments: ["Loop", "Shuffle", "Favourites"],
-                        selection: presetRotationModeBinding
+                        segments: ["Loop", "Shuffle", "Favourites", "Category"],
+                        selection: presetRotationModeBinding,
+                        accessibilityIdentifier: "rotation-mode"
                     )
                 }
 
@@ -51,7 +53,8 @@ struct SettingsScreenView: View {
                         title: "Transition style",
                         description: "Choose the visual handoff between presets.",
                         segments: ["Crossfade", "Instant cut"],
-                        selection: transitionStyleBinding
+                        selection: transitionStyleBinding,
+                        accessibilityIdentifier: "transition-style"
                     )
 
                     if settings.transitionStyle == .crossfade {
@@ -62,6 +65,7 @@ struct SettingsScreenView: View {
                             value: $settings.crossfadeDurationSeconds,
                             range: SettingsRanges.crossfadeDuration,
                             step: SettingsRanges.crossfadeDurationStep,
+                            accessibilityIdentifier: "crossfade-length",
                             formatter: formatSeconds
                         )
                     }
@@ -75,6 +79,7 @@ struct SettingsScreenView: View {
                         value: $settings.beatHardCutSensitivity,
                         range: SettingsRanges.beatHardCutSensitivity,
                         step: SettingsRanges.beatHardCutSensitivityStep,
+                        accessibilityIdentifier: "beat-cut-threshold",
                         formatter: formatPercent
                     )
 
@@ -86,6 +91,7 @@ struct SettingsScreenView: View {
                         range: SettingsRanges.audioSensitivity,
                         step: SettingsRanges.audioSensitivityStep,
                         usesMonospacedValue: false,
+                        accessibilityIdentifier: "reactivity",
                         formatter: formatReactivity
                     )
 
@@ -96,6 +102,7 @@ struct SettingsScreenView: View {
                         value: audioDelayBinding,
                         range: SettingsRanges.audioInputDelay,
                         step: SettingsRanges.audioInputDelayStep,
+                        accessibilityIdentifier: "audio-sync-delay",
                         formatter: formatMilliseconds
                     )
 
@@ -103,7 +110,8 @@ struct SettingsScreenView: View {
                         systemImage: "metronome.fill",
                         title: "Calibrate sync",
                         description: "Play rhythmic music, then nudge until the on-screen pulse matches what you hear. Calibrates your whole chain, including the TV.",
-                        action: { onCalibrateSync() }
+                        action: { onCalibrateSync() },
+                        accessibilityIdentifier: "calibrate-sync"
                     ) {
                         Text("Start")
                             .font(RVTheme.Fonts.caption.weight(.semibold))
@@ -121,7 +129,8 @@ struct SettingsScreenView: View {
                         title: "Frame rate",
                         description: "Caps the render rate. The actual rate follows the TV's refresh mode, so 25 and 50 only land exactly on 50 Hz output.",
                         segments: SettingsScreenView.allowedFrameRates.map { "\($0)" },
-                        selection: frameRateCapBinding
+                        selection: frameRateCapBinding,
+                        accessibilityIdentifier: "frame-rate"
                     )
 
                     RVSegmentRow(
@@ -129,7 +138,8 @@ struct SettingsScreenView: View {
                         title: "Render quality",
                         description: "Rendering size before the TV scales it. Sizes above 1080p look sharper but may reduce the frame rate on complex presets.",
                         segments: allowedDrawablePresets.map { RoonVisDrawableSizePresetLabel($0) },
-                        selection: drawableSizePresetBinding
+                        selection: drawableSizePresetBinding,
+                        accessibilityIdentifier: "render-quality"
                     )
 
                     RVStepperRow(
@@ -139,6 +149,7 @@ struct SettingsScreenView: View {
                         value: warpMeshBinding,
                         range: SettingsRanges.warpMesh,
                         step: SettingsRanges.warpMeshStep,
+                        accessibilityIdentifier: "warp-detail",
                         formatter: formatMesh
                     )
                 }
@@ -151,7 +162,8 @@ struct SettingsScreenView: View {
                         action: {
                             hostDraft = settings.snapcastServerHost
                             isEditingHost = true
-                        }
+                        },
+                        accessibilityIdentifier: "snapcast-server"
                     ) {
                         Text(settings.snapcastServerHost)
                             .font(RVTheme.Fonts.caption.monospaced())
@@ -165,6 +177,7 @@ struct SettingsScreenView: View {
                         systemImage: "gauge.with.dots.needle.67percent",
                         title: "Diagnostics overlay",
                         description: "Show render and audio timing while tuning performance.",
+                        accessibilityIdentifier: "diagnostics-overlay",
                         isOn: $settings.diagnosticsOverlayEnabled
                     )
                 }
@@ -293,6 +306,8 @@ struct SettingsScreenView: View {
                     return 0
                 case .favorites:
                     return 2
+                case .category:
+                    return 3
                 case .shuffle:
                     return 1
                 @unknown default:
@@ -305,6 +320,8 @@ struct SettingsScreenView: View {
                     settings.presetRotationMode = .loop
                 case 2:
                     settings.presetRotationMode = .favorites
+                case 3:
+                    settings.presetRotationMode = .category
                 default:
                     settings.presetRotationMode = .shuffle
                 }

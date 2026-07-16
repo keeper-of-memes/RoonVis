@@ -7,7 +7,7 @@
 NS_ASSUME_NONNULL_BEGIN
 
 @interface RoonVisPresetShelf (ProjectMPresetSupport)
-- (instancetype)initWithTitle:(NSString *)title presetIndexes:(NSArray<NSNumber *> *)presetIndexes;
+- (instancetype)initWithTitle:(NSString *)title category:(nullable NSString *)category presetIndexes:(NSArray<NSNumber *> *)presetIndexes;
 @end
 
 NSString *RoonVisHumanPresetTitle(NSString *title, NSUInteger index);

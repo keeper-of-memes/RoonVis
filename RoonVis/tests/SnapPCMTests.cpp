@@ -18,11 +18,19 @@ void RunPresetBlocklistTests();
 void RunLivePCMDelayBufferTests();
 void RunPresetRotationSchedulerTests();
 void RunPresetWarmCacheTests();
+void RunPresetDwellPlanTests();
 void RunLearnedSlowPresetStoreTests();
 void RunPreprocessCacheTests();
+void RunPreprocessCacheResourceTests();
 void RunDeviceTierTests();
 void RunPresetRotationCursorTests();
+void RunRotationEngineTests();
 void RunAudioOnsetDetectorTests();
+void RunPresetCompatTests();
+void RunLegacyNameMigrationTests();
+void RunPresetCapabilityManifestTests();
+void RunPresetEligibilityPolicyTests();
+void RunShaderBlobStoreTests();
 
 namespace
 {
@@ -469,11 +477,19 @@ int main()
     RunLivePCMDelayBufferTests();
     RunPresetRotationSchedulerTests();
     RunPresetWarmCacheTests();
+    RunPresetDwellPlanTests();
     RunLearnedSlowPresetStoreTests();
     RunPreprocessCacheTests();
+    RunPreprocessCacheResourceTests();
     RunDeviceTierTests();
     RunPresetRotationCursorTests();
+    RunRotationEngineTests();
     RunAudioOnsetDetectorTests();
+    RunPresetCompatTests();
+    RunLegacyNameMigrationTests();
+    RunPresetCapabilityManifestTests();
+    RunPresetEligibilityPolicyTests();
+    RunShaderBlobStoreTests();
 
     std::printf("RoonVisTests: %d passed, %d failed\n", Stats().passed, Stats().failed);
     return Stats().failed == 0 ? 0 : 1;

@@ -158,6 +158,39 @@ void TestEdgeCases()
     CHECK(buf.BufferedFrames() == 0);
 }
 
+// B8: the delay math must honor the real ceiling (audio delay 0..500 + sync-render
+// compensation 0..200 = 700ms), not the historical bare MIN(500, ...) that silently
+// truncated 501..700 while the reported effective delay was larger.
+void TestDelayFramesHonorsFullCeiling()
+{
+    constexpr uint32_t kSampleRate = 44100;
+    constexpr int64_t kClampMs = 700;             // 500 + 200
+    constexpr size_t kMaxBufferFrames = (kSampleRate * 1100) / 1000;  // ~1.1 s, 48510
+
+    // 550ms is above the old 500 truncation point: must NOT truncate to 500ms worth.
+    CHECK(LivePCMDelayFramesForMs(550, kClampMs, kSampleRate, kMaxBufferFrames)
+          == (static_cast<size_t>(550) * kSampleRate) / 1000);  // 24255, not 22050
+    CHECK(LivePCMDelayFramesForMs(550, kClampMs, kSampleRate, kMaxBufferFrames) != 22050);
+
+    // 700ms = the ceiling itself: full backlog, un-truncated.
+    CHECK(LivePCMDelayFramesForMs(700, kClampMs, kSampleRate, kMaxBufferFrames)
+          == (static_cast<size_t>(700) * kSampleRate) / 1000);  // 30870
+
+    // Above the clamp: truncated AT the clamp (700ms), not silently past it.
+    CHECK(LivePCMDelayFramesForMs(900, kClampMs, kSampleRate, kMaxBufferFrames)
+          == (static_cast<size_t>(700) * kSampleRate) / 1000);  // 30870
+
+    // Negative clamps to 0.
+    CHECK(LivePCMDelayFramesForMs(-10, kClampMs, kSampleRate, kMaxBufferFrames) == 0);
+
+    // Frames always stay strictly below the buffer cap, even at absurd requests.
+    CHECK(LivePCMDelayFramesForMs(550, kClampMs, kSampleRate, kMaxBufferFrames) < kMaxBufferFrames);
+    CHECK(LivePCMDelayFramesForMs(700, kClampMs, kSampleRate, kMaxBufferFrames) < kMaxBufferFrames);
+    CHECK(LivePCMDelayFramesForMs(1000000, kClampMs, kSampleRate, kMaxBufferFrames) < kMaxBufferFrames);
+    // With a clamp large enough to exceed the buffer, the cap (maxBufferFrames-1) binds.
+    CHECK(LivePCMDelayFramesForMs(5000, 5000, kSampleRate, kMaxBufferFrames) == kMaxBufferFrames - 1);
+}
+
 }  // namespace
 
 void RunLivePCMDelayBufferTests()
@@ -173,4 +206,5 @@ void RunLivePCMDelayBufferTests()
     TestClear();
     TestDefaultConstructedInert();
     TestEdgeCases();
+    TestDelayFramesHonorsFullCeiling();
 }

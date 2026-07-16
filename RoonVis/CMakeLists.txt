@@ -18,21 +18,45 @@ if(ROONVIS_BUILD_TESTS)
     Sources/RoonVis/PresetRotationScheduler.cpp
     Sources/RoonVis/PresetWarmCache.h
     Sources/RoonVis/PresetWarmCache.cpp
+    Sources/RoonVis/PresetDwellPlan.h
+    Sources/RoonVis/PresetDwellPlan.cpp
+    tests/PresetDwellPlanTests.cpp
     Sources/RoonVis/LearnedSlowPresetStore.h
     Sources/RoonVis/LearnedSlowPresetStore.cpp
     Sources/RoonVis/PreprocessCache.h
     Sources/RoonVis/PreprocessCache.cpp
+    Sources/RoonVis/PreprocessCacheResource.h
+    Sources/RoonVis/PreprocessCacheResource.cpp
+    tests/PreprocessCacheResourceTests.cpp
     Sources/RoonVis/DeviceTier.h
     Sources/RoonVis/DeviceTier.cpp
     Sources/RoonVis/PresetRotationCursor.h
     Sources/RoonVis/PresetRotationCursor.cpp
+    Sources/RoonVis/RotationEngine.h
+    Sources/RoonVis/RotationEngine.cpp
     Sources/RoonVis/AudioOnsetDetector.h
     Sources/RoonVis/AudioOnsetDetector.cpp
     Sources/RoonVis/SyncCalibrationMath.h
     Sources/RoonVis/SyncCalibrationMath.cpp
     tests/DeviceTierTests.cpp
     tests/PresetRotationCursorTests.cpp
+    tests/RotationEngineTests.cpp
     tests/AudioOnsetDetectorTests.cpp
+    Sources/RoonVis/PresetCompat.h
+    Sources/RoonVis/PresetCompat.cpp
+    tests/PresetCompatTests.cpp
+    Sources/RoonVis/LegacyNameMigration.h
+    Sources/RoonVis/LegacyNameMigration.cpp
+    tests/LegacyNameMigrationTests.cpp
+    Sources/RoonVis/PresetCapabilityManifest.h
+    Sources/RoonVis/PresetCapabilityManifest.cpp
+    Sources/RoonVis/PresetEligibilityPolicy.h
+    Sources/RoonVis/PresetEligibilityPolicy.cpp
+    tests/PresetCapabilityManifestTests.cpp
+    tests/PresetEligibilityPolicyTests.cpp
+    Sources/RoonVis/ShaderBlobStore.h
+    Sources/RoonVis/ShaderBlobStore.cpp
+    tests/ShaderBlobStoreTests.cpp
     tests/PresetShelfModelTests.cpp
     tests/SnapPCMTests.cpp
     tests/LivePCMDelayBufferTests.cpp
@@ -40,11 +64,20 @@ if(ROONVIS_BUILD_TESTS)
     tests/PresetWarmCacheTests.cpp
     tests/LearnedSlowPresetStoreTests.cpp
     tests/PreprocessCacheTests.cpp
+    "${CMAKE_CURRENT_LIST_DIR}/../vendor/projectm/src/libprojectM/MilkdropPreset/PresetFileParser.cpp"
+    "${CMAKE_CURRENT_LIST_DIR}/../vendor/projectm/src/libprojectM/Utils.cpp"
   )
   target_include_directories(RoonVisTests PRIVATE
     "${CMAKE_CURRENT_LIST_DIR}/Sources/RoonVis"
+    "${CMAKE_CURRENT_LIST_DIR}/../vendor/projectm/src/libprojectM"
+    "${CMAKE_CURRENT_LIST_DIR}/../vendor/projectm/src/libprojectM/MilkdropPreset"
   )
   target_compile_features(RoonVisTests PRIVATE cxx_std_17)
+  # ShaderBlobStore uses the system SQLite (libsqlite3.tbd on both macOS and tvOS).
+  target_link_libraries(RoonVisTests PRIVATE sqlite3)
+  # Quality gate: warning-clean on host targets in this branch. The app target gets
+  # -Wall -Wextra separately (its own triage; the app can't build in this worktree).
+  target_compile_options(RoonVisTests PRIVATE -Wall -Wextra)
 
   if(EXISTS "${CMAKE_CURRENT_LIST_DIR}/../vendor/projectm/src/libprojectM/Audio/Loudness.cpp")
     add_executable(SnapcastProjectMAudioProbe
@@ -62,6 +95,7 @@ if(ROONVIS_BUILD_TESTS)
       "${CMAKE_CURRENT_LIST_DIR}/projectm-build/src/api/include"
     )
     target_compile_features(SnapcastProjectMAudioProbe PRIVATE cxx_std_17)
+    target_compile_options(SnapcastProjectMAudioProbe PRIVATE -Wall -Wextra)
   endif()
 
   # Host-side golden determinism test for the GL-free HLSL preprocess pipeline.
@@ -77,6 +111,8 @@ if(ROONVIS_BUILD_TESTS)
      AND EXISTS "${PROJECTM_BUILD}/src/libprojectM/MilkdropPreset/MilkdropStaticShaders.cpp")
     add_executable(ShaderTranspileGolden
       tests/ShaderTranspileGolden.cpp
+      Sources/RoonVis/MilkdropTranspilePrep.h
+      Sources/RoonVis/MilkdropTranspilePrep.cpp
       "${PROJECTM_SRC}/MilkdropPreset/MilkdropShaderPreprocess.cpp"
       "${PROJECTM_SRC}/MilkdropPreset/PresetFileParser.cpp"
       "${PROJECTM_SRC}/Utils.cpp"
@@ -89,6 +125,7 @@ if(ROONVIS_BUILD_TESTS)
       "${HLSLPARSER_SRC}/HLSLTree.cpp"
     )
     target_include_directories(ShaderTranspileGolden PRIVATE
+      "${CMAKE_CURRENT_LIST_DIR}/Sources/RoonVis"
       "${PROJECTM_SRC}"
       "${PROJECTM_SRC}/MilkdropPreset"
       "${HLSLPARSER_SRC}"
@@ -100,6 +137,7 @@ if(ROONVIS_BUILD_TESTS)
       "${PROJECTM_BUILD}/include"
     )
     target_compile_features(ShaderTranspileGolden PRIVATE cxx_std_17)
+    target_compile_options(ShaderTranspileGolden PRIVATE -Wall -Wextra)
 
     # Build-time generator for the prepopulated preprocessed-HLSL cache resource.
     # Same GL-free source set + include dirs as ShaderTranspileGolden (it additionally
@@ -108,6 +146,12 @@ if(ROONVIS_BUILD_TESTS)
     # docs/preprocessor-transpile-stutter.md for the regen commands.
     add_executable(PreprocessCacheGen
       tests/PreprocessCacheGen.cpp
+      Sources/RoonVis/MilkdropTranspilePrep.h
+      Sources/RoonVis/MilkdropTranspilePrep.cpp
+      Sources/RoonVis/PreprocessCache.h
+      Sources/RoonVis/PreprocessCache.cpp
+      Sources/RoonVis/PreprocessCacheResource.h
+      Sources/RoonVis/PreprocessCacheResource.cpp
       "${PROJECTM_SRC}/MilkdropPreset/MilkdropShaderPreprocess.cpp"
       "${PROJECTM_SRC}/MilkdropPreset/PresetFileParser.cpp"
       "${PROJECTM_SRC}/Utils.cpp"
@@ -120,6 +164,7 @@ if(ROONVIS_BUILD_TESTS)
       "${HLSLPARSER_SRC}/HLSLTree.cpp"
     )
     target_include_directories(PreprocessCacheGen PRIVATE
+      "${CMAKE_CURRENT_LIST_DIR}/Sources/RoonVis"
       "${PROJECTM_SRC}"
       "${PROJECTM_SRC}/MilkdropPreset"
       "${HLSLPARSER_SRC}"
@@ -131,7 +176,57 @@ if(ROONVIS_BUILD_TESTS)
       "${PROJECTM_BUILD}/include"
     )
     target_compile_features(PreprocessCacheGen PRIVATE cxx_std_17)
+    target_compile_options(PreprocessCacheGen PRIVATE -Wall -Wextra)
+
+    # Tier-1 fidelity spike: GL-free reproduction of the exact parse-stage input text
+    # (MilkdropShader.cpp:545) per bundled preset shader, emitted as key TSV. Same GL-free
+    # source set + include dirs as PreprocessCacheGen; throwaway validation tooling.
+    add_executable(ParseInputHashGen
+      tests/ParseInputHashGen.cpp
+      Sources/RoonVis/MilkdropTranspilePrep.h
+      Sources/RoonVis/MilkdropTranspilePrep.cpp
+      "${PROJECTM_SRC}/MilkdropPreset/MilkdropShaderPreprocess.cpp"
+      "${PROJECTM_SRC}/MilkdropPreset/PresetFileParser.cpp"
+      "${PROJECTM_SRC}/Utils.cpp"
+      "${PROJECTM_BUILD}/src/libprojectM/MilkdropPreset/MilkdropStaticShaders.cpp"
+      "${HLSLPARSER_SRC}/CodeWriter.cpp"
+      "${HLSLPARSER_SRC}/Engine.cpp"
+      "${HLSLPARSER_SRC}/GLSLGenerator.cpp"
+      "${HLSLPARSER_SRC}/HLSLParser.cpp"
+      "${HLSLPARSER_SRC}/HLSLTokenizer.cpp"
+      "${HLSLPARSER_SRC}/HLSLTree.cpp"
+    )
+    target_include_directories(ParseInputHashGen PRIVATE
+      "${CMAKE_CURRENT_LIST_DIR}/Sources/RoonVis"
+      "${PROJECTM_SRC}"
+      "${PROJECTM_SRC}/MilkdropPreset"
+      "${HLSLPARSER_SRC}"
+      "${CMAKE_CURRENT_LIST_DIR}/../vendor/projectm/vendor"
+      "${CMAKE_CURRENT_LIST_DIR}/../vendor/projectm/vendor/glad/include"
+      "${PROJECTM_BUILD}/src/libprojectM/MilkdropPreset"
+      "${PROJECTM_SRC}/../api/include"
+      "${PROJECTM_BUILD}/src/api/include"
+      "${PROJECTM_BUILD}/include"
+    )
+    target_compile_features(ParseInputHashGen PRIVATE cxx_std_17)
+    target_compile_options(ParseInputHashGen PRIVATE -Wall -Wextra)
   endif()
+
+  # Host-side static preset-compatibility scanner (A15/A8 tier verdicts).
+  # Pure feature extraction + derived rules; NOT linked into the tvOS app.
+  add_executable(PresetCompatScan
+    tests/PresetCompatScan.cpp
+    Sources/RoonVis/PresetCompat.cpp
+    "${PROJECTM_SRC}/MilkdropPreset/PresetFileParser.cpp"
+    "${PROJECTM_SRC}/Utils.cpp"
+  )
+  target_include_directories(PresetCompatScan PRIVATE
+    Sources/RoonVis
+    "${PROJECTM_SRC}"
+    "${PROJECTM_SRC}/MilkdropPreset"
+  )
+  target_compile_features(PresetCompatScan PRIVATE cxx_std_17)
+  target_compile_options(PresetCompatScan PRIVATE -Wall -Wextra)
 endif()
 
 if(NOT ROONVIS_BUILD_APP)
@@ -267,32 +362,26 @@ set_target_properties(projectM PROPERTIES
 set(TEST_AUDIO_RESOURCE "${CMAKE_CURRENT_LIST_DIR}/Resources/TestAudio.wav")
 set(TEST_PRESET_RESOURCE "${PROJECTM_ROOT}/presets/tests/300-beatdetect-bassmidtreb.milk")
 set(PRESET_BLOCKLIST_RESOURCE "${CMAKE_CURRENT_LIST_DIR}/Resources/PresetBlocklist.json")
+set(HD_VERIFIED_RESOURCE "${CMAKE_CURRENT_LIST_DIR}/Resources/HDVerifiedPresets.json")
+set(HD_CAPABILITY_MANIFEST_RESOURCE "${CMAKE_CURRENT_LIST_DIR}/Resources/HDCapabilityManifest.json")
+set(LEGACY_MAP_RESOURCE "${CMAKE_CURRENT_LIST_DIR}/Resources/LegacyNameMap.json")
 # Prepopulated preprocessed-HLSL cache: a build-time-generated binary the app seeds into
 # its runtime PreprocessCache at startup so the first load of any bundled preset is a cache
 # hit. Referenced explicitly (never globbed) so no stray file can slip into the bundle.
 # Regenerate via the PreprocessCacheGen host tool -- see the note in
 # docs/preprocessor-transpile-stutter.md.
 set(PREPROCESS_CACHE_RESOURCE "${CMAKE_CURRENT_LIST_DIR}/Resources/preprocess-cache/preprocess-cache.bin")
-file(GLOB PRESET_FILES LIST_DIRECTORIES false "${CMAKE_CURRENT_LIST_DIR}/Resources/presets/*.milk")
-file(GLOB TEXTURE_FILES LIST_DIRECTORIES false "${CMAKE_CURRENT_LIST_DIR}/Resources/textures/*")
-file(GLOB THUMBNAIL_FILES LIST_DIRECTORIES false "${CMAKE_CURRENT_LIST_DIR}/Resources/PresetThumbnails/*")
+# Preset + preview + texture TREES ship via the post-build rsync phase below:
+# per-file pbxproj entries would explode configure/build times, and the GLOB path
+# had no delete semantics (a removed texture persisted in stale incremental bundles).
 set_source_files_properties(
   "${TEST_AUDIO_RESOURCE}"
   "${TEST_PRESET_RESOURCE}"
   "${PRESET_BLOCKLIST_RESOURCE}"
+  "${HD_VERIFIED_RESOURCE}"
+  "${HD_CAPABILITY_MANIFEST_RESOURCE}"
+  "${LEGACY_MAP_RESOURCE}"
   PROPERTIES MACOSX_PACKAGE_LOCATION Resources
-)
-set_source_files_properties(
-  ${PRESET_FILES}
-  PROPERTIES MACOSX_PACKAGE_LOCATION presets
-)
-set_source_files_properties(
-  ${TEXTURE_FILES}
-  PROPERTIES MACOSX_PACKAGE_LOCATION textures
-)
-set_source_files_properties(
-  ${THUMBNAIL_FILES}
-  PROPERTIES MACOSX_PACKAGE_LOCATION PresetThumbnails
 )
 set_source_files_properties(
   "${PREPROCESS_CACHE_RESOURCE}"
@@ -344,26 +433,47 @@ add_executable(RoonVis MACOSX_BUNDLE
   Sources/RoonVis/PresetRotationScheduler.cpp
   Sources/RoonVis/PresetWarmCache.h
   Sources/RoonVis/PresetWarmCache.cpp
+  Sources/RoonVis/PresetDwellPlan.h
+  Sources/RoonVis/PresetDwellPlan.cpp
   Sources/RoonVis/LearnedSlowPresetStore.h
   Sources/RoonVis/LearnedSlowPresetStore.cpp
+  Sources/RoonVis/LegacyNameMigration.h
+  Sources/RoonVis/LegacyNameMigration.cpp
+  Sources/RoonVis/LegacyNameMigrationSupport.h
+  Sources/RoonVis/LegacyNameMigrationSupport.mm
   Sources/RoonVis/PreprocessCache.h
   Sources/RoonVis/PreprocessCache.cpp
+  Sources/RoonVis/PreprocessCacheResource.h
+  Sources/RoonVis/PreprocessCacheResource.cpp
   Sources/RoonVis/PresetWarmSettings.h
   Sources/RoonVis/PresetWarmSettings.mm
   Sources/RoonVis/DeviceTier.h
   Sources/RoonVis/DeviceTier.cpp
   Sources/RoonVis/PresetRotationCursor.h
   Sources/RoonVis/PresetRotationCursor.cpp
+  Sources/RoonVis/RotationEngine.h
+  Sources/RoonVis/RotationEngine.cpp
+  Sources/RoonVis/PresetCapabilityManifest.h
+  Sources/RoonVis/PresetCapabilityManifest.cpp
+  Sources/RoonVis/PresetEligibilityPolicy.h
+  Sources/RoonVis/PresetEligibilityPolicy.cpp
+  Sources/RoonVis/ShaderBlobStore.h
+  Sources/RoonVis/ShaderBlobStore.cpp
+  Sources/RoonVis/ShaderBlobCacheAdapter.h
+  Sources/RoonVis/ShaderBlobCacheAdapter.mm
   Sources/RoonVis/AudioOnsetDetector.h
   Sources/RoonVis/AudioOnsetDetector.cpp
   Sources/RoonVis/SyncCalibrationMath.h
   Sources/RoonVis/SyncCalibrationMath.cpp
+  Sources/RoonVis/RoonVisCapabilityCatalog.h
+  Sources/RoonVis/RoonVisCapabilityCatalog.mm
   Sources/RoonVis/RoonVisDeviceTier.h
   Sources/RoonVis/RoonVisDeviceTier.mm
   Sources/RoonVis/RoonVisCrashReporter.h
   Sources/RoonVis/RoonVisCrashReporter.mm
   Sources/RoonVis/RoonVisPerfCounters.h
   Sources/RoonVis/RoonVisPerfCounters.mm
+  Sources/RoonVis/RoonVisPerfDiagnosticsSink.h
   Sources/RoonVis/RoonVisSettings.h
   Sources/RoonVis/RoonVisSettings.mm
   Sources/RoonVis/RoonVisTheme.h
@@ -376,12 +486,34 @@ add_executable(RoonVis MACOSX_BUNDLE
   "${TEST_AUDIO_RESOURCE}"
   "${TEST_PRESET_RESOURCE}"
   "${PRESET_BLOCKLIST_RESOURCE}"
+  "${HD_VERIFIED_RESOURCE}"
+  "${HD_CAPABILITY_MANIFEST_RESOURCE}"
+  "${LEGACY_MAP_RESOURCE}"
   "${PREPROCESS_CACHE_RESOURCE}"
-  ${PRESET_FILES}
-  ${TEXTURE_FILES}
-  ${THUMBNAIL_FILES}
 )
+
+# Tree-copy phase: rsync the preset + preview + texture trees into the bundle. Runs as
+# a post-build script phase, which Xcode executes BEFORE code signing (signing
+# seals the copied files). --delete keeps stale files out of incremental
+# builds (the historical stale-resource gotcha). The textures/ destination is
+# load-bearing: ProjectMBridge registers resourcePath/textures as a texture search path.
+add_custom_command(TARGET RoonVis POST_BUILD
+  COMMAND rsync -a --delete "${CMAKE_CURRENT_LIST_DIR}/Resources/presets/" "$<TARGET_BUNDLE_CONTENT_DIR:RoonVis>/presets/"
+  COMMAND rsync -a --delete "${CMAKE_CURRENT_LIST_DIR}/Resources/PresetPreviews/" "$<TARGET_BUNDLE_CONTENT_DIR:RoonVis>/PresetPreviews/"
+  COMMAND rsync -a --delete "${CMAKE_CURRENT_LIST_DIR}/Resources/textures/" "$<TARGET_BUNDLE_CONTENT_DIR:RoonVis>/textures/"
+  COMMENT "Copying preset + preview + texture trees into the app bundle"
+)
+
+# Quality gate: warning-clean first-party app code (-Wall -Wextra; ObjC/C++ only —
+# Swift has its own diagnostics). Vendor targets keep their own suppressions.
+target_compile_options(RoonVis PRIVATE
+  $<$<COMPILE_LANGUAGE:OBJCXX>:-Wall -Wextra>
+  $<$<COMPILE_LANGUAGE:CXX>:-Wall -Wextra>
+  $<$<COMPILE_LANGUAGE:OBJC>:-Wall -Wextra>
+)
+
 target_link_libraries(RoonVis PRIVATE
+  sqlite3
   ANGLE
   projectM
   z

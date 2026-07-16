@@ -11,6 +11,8 @@ FOUNDATION_EXPORT NSNotificationName const RoonVisEngineStateDidChangeNotificati
 
 @interface RoonVisPresetShelf : NSObject
 
+// Top-category for section headers (empty when author-clustered).
+@property(nonatomic, readonly, copy, nullable) NSString *category;
 @property(nonatomic, copy, readonly) NSString *title;
 @property(nonatomic, copy, readonly) NSArray<NSNumber *> *presetIndexes;
 
@@ -32,6 +34,11 @@ FOUNDATION_EXPORT NSNotificationName const RoonVisEngineStateDidChangeNotificati
 // True while live Snapcast PCM is flowing (enqueue within the last 3 s) - the
 // calibration entry gate. Never true for the bundled-WAV fallback.
 @property(nonatomic, readonly) BOOL isLivePCMActive;
+
+// Transpile-cache observability (W5 verification): cumulative PreprocessCache
+// counters across BOTH stages (preprocess + parse-gen). Init/GL thread reads only.
+@property(nonatomic, readonly) NSUInteger transpileCacheHits;
+@property(nonatomic, readonly) NSUInteger transpileCacheMisses;
 @property(nonatomic, readonly) BOOL syncCalibrationActive;
 @property(nonatomic, readonly) NSInteger syncCalibrationDelayMs;
 // Set when the onset detector fired within the samples consumed this frame;
@@ -53,6 +60,15 @@ FOUNDATION_EXPORT NSNotificationName const RoonVisEngineStateDidChangeNotificati
 
 - (instancetype)initWithDrawableSize:(CGSize)drawableSize;
 - (void)resizeToDrawableSize:(CGSize)drawableSize;
+// Re-applies the effective (capped) fps hint to projectM. Decoupled from
+// -resizeToDrawableSize: so frame-rate-cap changes don't do resize work and
+// resizes don't re-derive fps. Main/GL thread only (projectm_* invariant).
+- (void)refreshProjectMFPSHint;
+// A genuine EGL surface recreation drops the compiled preload slot even at an
+// UNCHANGED drawable size (which -resizeToDrawableSize:'s same-size guard
+// intentionally skips), so the recreation path calls this to force the
+// dwell-plan recompute that re-arms preload/warm tracking. Main/GL thread only.
+- (void)noteEGLSurfaceRecreated;
 - (void)enqueueLivePCMInt16:(const int16_t *)interleaved frameCount:(NSUInteger)frameCount;
 - (void)clearLivePCMBuffer;
 - (NSUInteger)presetCount;
@@ -63,6 +79,7 @@ FOUNDATION_EXPORT NSNotificationName const RoonVisEngineStateDidChangeNotificati
 - (NSString *)presetPathForUIAtIndex:(NSUInteger)index NS_SWIFT_NAME(presetPathForUI(at:));
 - (BOOL)isFavoriteAtIndex:(NSUInteger)index NS_SWIFT_NAME(isFavorite(at:));
 - (NSArray<RoonVisPresetShelf *> *)presetShelvesFavoritesOnly:(BOOL)favoritesOnly;
+- (nullable NSString *)presetCategoryAtIndex:(NSUInteger)index;
 - (NSInteger)currentPresetIndex;
 - (BOOL)loadInitialPreset;
 - (BOOL)selectPresetAtIndex:(NSUInteger)index smooth:(BOOL)smooth;

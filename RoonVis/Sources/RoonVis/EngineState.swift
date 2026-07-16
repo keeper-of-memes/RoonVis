@@ -26,12 +26,31 @@ final class EngineState: ObservableObject {
     @Published private(set) var toast: RemoteStatusToast?
     @Published private(set) var warmup = PresetWarmupState(active: true, text: "Preparing...")
 
+    /// Single library-mutation signal. Mirrors RoonVisSettings.librarySetsRevision
+    /// (bumped ONLY by the favorite/hidden set setters). The shelf cache and the
+    /// browser views rebuild off this instead of a per-view refresh token, so the
+    /// ~930ms shelf rebuild happens once per library change, not per tab-switch or
+    /// per-toggle. Authoritative counter (never self-incremented) so a coalesced or
+    /// missed notification can't drift it from the ObjC source of truth.
+    @Published private(set) var libraryRevision = 0
+
     weak var glView: ANGLEGLView?
+
+    /// Environment-scoped raw-shelf cache keyed by browse scope. Both tabs stay warm.
+    /// An entry is valid while its (presetCount, libraryRevision) still match; on a
+    /// mismatch the entry is rebuilt from the bridge (the expensive ObjC->Swift call).
+    private struct RawShelfCacheEntry {
+        let presetCount: Int
+        let libraryRevision: Int
+        let shelves: [RoonVisPresetShelf]
+    }
+    private var rawShelfCache: [PresetBrowserScope: RawShelfCacheEntry] = [:]
 
     private var bridgeObserver: NSObjectProtocol?
     private var connectionObserver: NSObjectProtocol?
     private var toastObserver: NSObjectProtocol?
     private var warmupObserver: NSObjectProtocol?
+    private var settingsObserver: NSObjectProtocol?
     private var pendingToastClear: DispatchWorkItem?
 
     init() {
@@ -80,6 +99,27 @@ final class EngineState: ObservableObject {
                 self?.updateBridgeState(from: notification)
             }
         }
+
+        // Library-mutation revision. The favorite/hidden setters post this notification
+        // with userInfo["key"] == the changed key; only those two keys bump the
+        // authoritative librarySetsRevision, so we filter on them and re-read the
+        // counter rather than self-incrementing.
+        settingsObserver = NotificationCenter.default.addObserver(
+            forName: NSNotification.Name.RoonVisSettingsDidChange,
+            object: nil,
+            queue: .main
+        ) { [weak self] notification in
+            guard
+                let key = notification.userInfo?["key"] as? String,
+                key == RoonVisSettingsFavoritePresetFilenamesKey
+                    || key == RoonVisSettingsHiddenPresetFilenamesKey
+            else {
+                return
+            }
+            Task { @MainActor in
+                self?.updateLibraryRevision()
+            }
+        }
     }
 
     deinit {
@@ -95,6 +135,9 @@ final class EngineState: ObservableObject {
         }
         if let warmupObserver {
             NotificationCenter.default.removeObserver(warmupObserver)
+        }
+        if let settingsObserver {
+            NotificationCenter.default.removeObserver(settingsObserver)
         }
     }
 
@@ -129,6 +172,34 @@ final class EngineState: ObservableObject {
         update(&presetRotationHeld, bridge.presetRotationHeld)
         update(&currentPresetIndex, Int(bridge.currentPresetIndex()))
         update(&presetCount, Int(bridge.presetCount()))
+    }
+
+    private func updateLibraryRevision() {
+        update(&libraryRevision, Int(RoonVisSettings.shared().librarySetsRevision))
+    }
+
+    /// Memoized raw shelves for a browse scope. The bridge call
+    /// (`presetShelvesFavoritesOnly:`) is the ~930ms cost at CotC scale; we keep one
+    /// warm entry per scope and only re-fetch when the pack size or library revision
+    /// changed. The returned ObjC shelves are mapped to Swift view models by the view
+    /// (cheap index copies), so this seam stays inside the bridge boundary.
+    func rawShelves(scope: PresetBrowserScope) -> [RoonVisPresetShelf] {
+        guard let bridge = glView?.bridge else {
+            rawShelfCache[scope] = nil
+            return []
+        }
+        if let entry = rawShelfCache[scope],
+           entry.presetCount == presetCount,
+           entry.libraryRevision == libraryRevision {
+            return entry.shelves
+        }
+        let shelves = bridge.presetShelvesFavoritesOnly(scope.usesFavoritesOnly)
+        rawShelfCache[scope] = RawShelfCacheEntry(
+            presetCount: presetCount,
+            libraryRevision: libraryRevision,
+            shelves: shelves
+        )
+        return shelves
     }
 
     private func updateConnectionState(_ state: SnapcastClientConnectionState) {
@@ -214,6 +285,7 @@ extension EngineState {
 final class DiagnosticsState: ObservableObject {
     @Published private(set) var fps = 0.0
     @Published private(set) var frameTimeMs = 0.0
+    @Published private(set) var droppedFrames = 0
 
     weak var glView: ANGLEGLView?
     private var timer: Timer?
@@ -238,10 +310,20 @@ final class DiagnosticsState: ObservableObject {
     }
 
     private func poll() {
-        let newFPS = glView?.diagnosticsFPS ?? 0.0
+        // No publishing while the HUD is hidden: the 0.5s tick still fires, but skipping
+        // the read+publish avoids waking observers when nothing is on screen. The timer
+        // itself is kept running (cheap; gating its creation/teardown adds lifecycle risk
+        // for no measurable win).
+        guard RoonVisSettings.shared().isDiagnosticsOverlayEnabled else { return }
+        // Live sampler (RC feedback): hudCurrentFPS is a sample-and-reset window
+        // over the frames since the previous poll, so the HUD is live from the
+        // first tick instead of waiting on the 5s diagnostics window.
+        let newFPS = glView?.hudCurrentFPS() ?? 0.0
         let newFrameMs = glView?.diagnosticsFrameTimeMs ?? 0.0
+        let newDropped = Int(glView?.droppedFramesSincePresetChange ?? 0)
         if fps != newFPS { fps = newFPS }
         if frameTimeMs != newFrameMs { frameTimeMs = newFrameMs }
+        if droppedFrames != newDropped { droppedFrames = newDropped }
     }
 }
 
@@ -250,7 +332,6 @@ final class RoonVisUIEnvironment {
     let engine: EngineState
     let settings: SettingsStore
     let diagnostics: DiagnosticsState
-    var lastBrowseTab: BrowseModalTab = .presets
 
     init(glView: ANGLEGLView) {
         engine = EngineState()

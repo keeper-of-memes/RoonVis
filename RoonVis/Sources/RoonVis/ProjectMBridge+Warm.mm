@@ -11,10 +11,14 @@
 - (NSString *)presetDisplayNameForPath:(const std::string &)path;
 @end
 
-@interface ProjectMBridge (WarmTimingPrivate)
-- (BOOL)canWarmPresetAtTime:(CFTimeInterval)now
-    postTransitionSettleSeconds:(CFTimeInterval)postTransitionSettleSeconds
-                 minLeadSeconds:(CFTimeInterval)minLeadSeconds;
+@interface ProjectMBridge (DwellPlanPrivate)
+// Compute one dwell plan with the given settle/lead constants, porting the perf-sweep /
+// crasher-scan overrides that used to live inside canWarmPresetAtTime into the smoothWindow
+// and rotationInterval fed to the pure ComputeDwellPlan core (so ROONVIS perf-sweep /
+// crasher-scan burn-ins still exercise their short timings).
+- (RoonVis::PresetDwellPlan)computeDwellPlanWithSettleSeconds:(CFTimeInterval)settleSeconds
+                                              minLeadSeconds:(CFTimeInterval)minLeadSeconds
+                                                      atTime:(CFTimeInterval)now;
 @end
 
 namespace
@@ -165,58 +169,33 @@ static NSString *const kClearLearnedSlowPresetsKey = @"RoonVisClearLearnedSlowPr
 - (void)invalidatePreloadedPresetTracking
 {
     _preloadedPresetPath.clear();
-    _preloadAttemptPresetPath.clear();
     _preloadedPresetIndex = SIZE_MAX;
-    _preloadAttemptPresetIndex = SIZE_MAX;
 }
 
-- (void)schedulePresetPreloadIfReadyAtTime:(CFTimeInterval)now
+- (RoonVis::PresetDwellPlan)computeDwellPlanWithSettleSeconds:(CFTimeInterval)settleSeconds
+                                              minLeadSeconds:(CFTimeInterval)minLeadSeconds
+                                                      atTime:(CFTimeInterval)now
 {
-    // Phase 3c diagnostics: track the background compile of an in-flight preload
-    // (direct-preload path; the warm-cache path polls from the render loop).
-    [self notePreloadCompileProgressAtTime:now];
-
-    if (![self canWarmPresetAtTime:now
-        postTransitionSettleSeconds:kPresetDirectPreloadPostTransitionSettleSeconds
-                      minLeadSeconds:kPresetDirectPreloadMinLeadSeconds])
-    {
-        return;
-    }
-
-    std::vector<RoonVis::PresetWarmCandidate> candidates = [self presetWarmCandidatesWithDepth:1];
-    if (candidates.empty())
-    {
-        return;
-    }
-    [self warmPresetOnRenderThread:candidates.front()];
-}
-
-- (BOOL)canWarmPresetAtTime:(CFTimeInterval)now
-{
-    return [self canWarmPresetAtTime:now
-        postTransitionSettleSeconds:kPresetPreloadPostTransitionSettleSeconds
-                      minLeadSeconds:kPresetPreloadMinLeadSeconds];
-}
-
-- (BOOL)canWarmPresetAtTime:(CFTimeInterval)now
-    postTransitionSettleSeconds:(CFTimeInterval)postTransitionSettleSeconds
-                 minLeadSeconds:(CFTimeInterval)minLeadSeconds
-{
+    // No projectM / no presets / nothing confirmed yet -> Idle (never ready). The pure
+    // core treats SIZE_MAX nextIndex as Exhausted; return a plain Idle plan here so an
+    // uninitialized bridge is distinguishable from a genuine HOLD.
+    (void)now;
     if (self.projectM == nullptr || _presetPaths.empty() || _confirmedPresetIndex == SIZE_MAX)
     {
-        return NO;
+        return RoonVis::PresetDwellPlan{};
     }
 
+    // Smooth (crossfade) window contribution, with the perf-sweep override that used to
+    // live inside canWarmPresetAtTime ported here.
     double smoothWindow = 0.0;
     if ([self settingsTransitionUsesSmoothCut])
     {
-        smoothWindow = RoonVisPerfSweepPresetTimingEnabled() ? kPerfSweepSoftCutDurationSeconds : _crossfadeDurationSeconds;
+        smoothWindow = RoonVisPerfSweepPresetTimingEnabled() ? kPerfSweepSoftCutDurationSeconds
+                                                             : _crossfadeDurationSeconds;
     }
 
-    // Preload only once the active transition has ended and a short settle has elapsed.
-    // If the rotation interval is too short to reach that point and still leave lead
-    // before the next switch, skip preloading this cycle and fall back to normal load.
-    double settleWindow = smoothWindow + postTransitionSettleSeconds;
+    // Rotation interval, with the perf-sweep / crasher-scan overrides ported here so the
+    // diagnostic burn-ins keep their short cadence.
     double rotationInterval = _rotationIntervalSeconds;
     if (RoonVisPerfSweepPresetTimingEnabled())
     {
@@ -226,58 +205,77 @@ static NSString *const kClearLearnedSlowPresetsKey = @"RoonVisClearLearnedSlowPr
     {
         rotationInterval = 0.6;
     }
-    if (rotationInterval - settleWindow < minLeadSeconds)
+
+    // The single rotation walk that used to run every frame now runs once per recompute.
+    size_t nextIndex = [self nextRotationIndexFrom:[self rotationAnchorIndex] offset:1];
+    std::string nextPath;
+    if (nextIndex != SIZE_MAX && nextIndex < _presetPaths.size() && nextIndex != _confirmedPresetIndex)
+    {
+        nextPath = _presetPaths[nextIndex];
+    }
+    else
+    {
+        // Same-index / out-of-range -> nothing to preload -> HOLD (Exhausted).
+        nextIndex = SIZE_MAX;
+    }
+
+    return RoonVis::ComputeDwellPlan(nextIndex, nextPath, _lastPresetSwitchTime, rotationInterval,
+                                     smoothWindow, settleSeconds, minLeadSeconds);
+}
+
+- (void)recomputeDwellPlansAtTime:(CFTimeInterval)now
+{
+    // A recompute event has changed what/whether the next preset is; the previously
+    // preloaded target may now be stale. Invalidate preload tracking, then recompute both
+    // plans (direct-preload path constants and warm-cache-driver constants).
+    [self invalidatePreloadedPresetTracking];
+    _dwellPlanDirect = [self computeDwellPlanWithSettleSeconds:kPresetDirectPreloadPostTransitionSettleSeconds
+                                               minLeadSeconds:kPresetDirectPreloadMinLeadSeconds
+                                                       atTime:now];
+    _dwellPlanWarm = [self computeDwellPlanWithSettleSeconds:kPresetPreloadPostTransitionSettleSeconds
+                                             minLeadSeconds:kPresetPreloadMinLeadSeconds
+                                                     atTime:now];
+}
+
+- (void)noteSwitchConfirmedAtTime:(CFTimeInterval)now
+{
+    _lastPresetSwitchTime = now;
+    [self recomputeDwellPlansAtTime:now];
+}
+
+- (void)schedulePresetPreloadIfReadyAtTime:(CFTimeInterval)now
+{
+    // Phase 3c diagnostics: track the background compile of an in-flight preload
+    // (direct-preload path; the warm-cache path polls from the render loop).
+    [self notePreloadCompileProgressAtTime:now];
+
+    // Per-frame cost is now one comparison (A5). No rotation walk, no window math.
+    if (!RoonVis::DwellPlanReady(_dwellPlanDirect, now))
+    {
+        return;
+    }
+
+    RoonVis::PresetWarmCandidate candidate{_dwellPlanDirect.targetIndex, _dwellPlanDirect.targetPath};
+    BOOL warmed = [self warmPresetOnRenderThread:candidate];
+    // Satisfaction/exhaustion is plan state now: a success ends this dwell's direct-preload
+    // work; a failure must not retry until a recompute replaces the plan (equivalence to the
+    // legacy depth-1 attempt-filter is argued in PresetDwellPlanTests).
+    _dwellPlanDirect.state = warmed ? RoonVis::PresetDwellPlan::State::Satisfied
+                                    : RoonVis::PresetDwellPlan::State::Exhausted;
+}
+
+- (BOOL)dwellPlanWarmCandidateReadyAtTime:(CFTimeInterval)now
+                                candidate:(RoonVis::PresetWarmCandidate *)out
+{
+    if (!RoonVis::DwellPlanReady(_dwellPlanWarm, now))
     {
         return NO;
     }
-    if (_lastPresetSwitchTime <= 0 || now - _lastPresetSwitchTime < settleWindow)
+    if (out != nullptr)
     {
-        return NO;
+        *out = RoonVis::PresetWarmCandidate{_dwellPlanWarm.targetIndex, _dwellPlanWarm.targetPath};
     }
     return YES;
-}
-
-- (std::vector<RoonVis::PresetWarmCandidate>)presetWarmCandidatesWithDepth:(size_t)depth
-{
-    return [self presetWarmCandidatesWithDepth:depth includePreloadAttempt:NO];
-}
-
-- (std::vector<RoonVis::PresetWarmCandidate>)presetWarmCandidatesWithDepth:(size_t)depth
-                                                      includePreloadAttempt:(BOOL)includePreloadAttempt
-{
-    std::vector<RoonVis::PresetWarmCandidate> candidates;
-    if (self.projectM == nullptr || _presetPaths.empty() || _confirmedPresetIndex == SIZE_MAX)
-    {
-        return candidates;
-    }
-
-    const size_t candidateDepth = std::max<size_t>(1, depth);
-    candidates.reserve(candidateDepth);
-    for (size_t offset = 1; offset <= candidateDepth; offset++)
-    {
-        size_t nextIndex = [self nextRotationIndexFrom:[self rotationAnchorIndex] offset:static_cast<NSInteger>(offset)];
-        if (nextIndex == SIZE_MAX || nextIndex >= _presetPaths.size() || nextIndex == _confirmedPresetIndex)
-        {
-            break;
-        }
-
-        const std::string &nextPath = _presetPaths[nextIndex];
-        if (!includePreloadAttempt &&
-            _preloadAttemptPresetIndex == _confirmedPresetIndex &&
-            _preloadAttemptPresetPath == nextPath)
-        {
-            continue;
-        }
-
-        bool duplicate = std::any_of(candidates.begin(), candidates.end(), [&](const RoonVis::PresetWarmCandidate &candidate) {
-            return candidate.index == nextIndex && candidate.path == nextPath;
-        });
-        if (!duplicate)
-        {
-            candidates.push_back({nextIndex, nextPath});
-        }
-    }
-    return candidates;
 }
 
 - (BOOL)warmPresetOnRenderThread:(const RoonVis::PresetWarmCandidate &)candidate
@@ -300,14 +298,10 @@ static NSString *const kClearLearnedSlowPresetsKey = @"RoonVisClearLearnedSlowPr
         return YES;
     }
 
-    if (_preloadAttemptPresetIndex == _confirmedPresetIndex && _preloadAttemptPresetPath == candidate.path)
-    {
-        return NO;
-    }
-
+    // A5: the "don't re-attempt within this dwell" guard is now the dwell plan's
+    // Satisfied/Exhausted state (set by the callers after this returns), not a
+    // (_preloadAttemptPresetIndex, _preloadAttemptPresetPath) filter.
     NSString *presetName = [self presetDisplayNameForPath:candidate.path];
-    _preloadAttemptPresetIndex = _confirmedPresetIndex;
-    _preloadAttemptPresetPath = candidate.path;
     _preloadedPresetIndex = candidate.index;
     _preloadedPresetPath = candidate.path;
     _preloadingPreset = YES;

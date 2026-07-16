@@ -134,7 +134,8 @@ uint64_t Fnv1a64Accumulate(uint64_t hash, const std::string &data)
 } // namespace
 
 std::string ShuffleOrderFingerprint(const std::vector<std::string> &packFilenames,
-                                    const std::vector<std::string> &learnedSlowConfirmed)
+                                    const std::vector<std::string> &learnedSlowConfirmed,
+                                    const std::string &scope)
 {
     std::vector<std::string> pack = packFilenames;
     std::vector<std::string> slow = learnedSlowConfirmed;
@@ -151,10 +152,46 @@ std::string ShuffleOrderFingerprint(const std::vector<std::string> &packFilename
     {
         hash = Fnv1a64Accumulate(hash, name);
     }
+    // Scope participates in the identity, but scope "" (the global Shuffle
+    // order) accumulates NOTHING so its value stays byte-identical to the
+    // historical two-argument fingerprint - orders migrated from the legacy
+    // single-shuffle keys keep validating.
+    if (!scope.empty())
+    {
+        hash = Fnv1a64Accumulate(hash, "|scope|");
+        hash = Fnv1a64Accumulate(hash, scope);
+    }
 
     char buffer[24];
     std::snprintf(buffer, sizeof(buffer), "sfp1-%016llx", static_cast<unsigned long long>(hash));
     return std::string(buffer);
+}
+
+ScopedRotationOrderStore UpsertScopedRotationOrder(const ScopedRotationOrderStore &store,
+                                                   const std::string &scope,
+                                                   const ScopedRotationOrder &entry)
+{
+    ScopedRotationOrderStore updated = store;
+    updated[scope] = entry;
+    return updated;
+}
+
+std::vector<size_t> CategoryMemberIndexes(const std::vector<std::string> &categories,
+                                          const std::string &category)
+{
+    std::vector<size_t> members;
+    if (category.empty())
+    {
+        return members;
+    }
+    for (size_t index = 0; index < categories.size(); index++)
+    {
+        if (categories[index] == category)
+        {
+            members.push_back(index);
+        }
+    }
+    return members;
 }
 
 std::vector<size_t> RestoreShuffleOrder(const std::vector<std::string> &storedOrder,

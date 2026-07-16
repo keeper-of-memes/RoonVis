@@ -397,6 +397,7 @@ void AppendLE32(std::vector<uint8_t> &bytes, uint32_t value)
     }
 
     nw_connection_receive(_connection, 1, 65536, ^(dispatch_data_t content, nw_content_context_t context, bool isComplete, nw_error_t error) {
+        (void)context;
         if (error != nil)
         {
             NSLog(@"Snapcast Step 1 receive failed: %@", error);
@@ -407,6 +408,8 @@ void AppendLE32(std::vector<uint8_t> &bytes, uint32_t value)
         if (content != nil)
         {
             dispatch_data_apply(content, ^bool(dispatch_data_t region, size_t offset, const void *buffer, size_t size) {
+                (void)region;
+                (void)offset;
                 const uint8_t *bytes = static_cast<const uint8_t *>(buffer);
                 self->_pendingBytes.insert(self->_pendingBytes.end(), bytes, bytes + size);
                 return true;
@@ -531,6 +534,14 @@ void AppendLE32(std::vector<uint8_t> &bytes, uint32_t value)
               _format.sampleRate,
               _format.channels,
               _format.bitsPerSample);
+        // The stream is accepted at any supported rate, but the app's delay math and onset
+        // detector assume 44.1k (kLivePCMSampleRate). Warn loudly (once, per codec header)
+        // so a mismatched pipeline is diagnosable. Behavior is unchanged.
+        if (_format.sampleRate != 44100)
+        {
+            NSLog(@"Snapcast WARNING: CodecHeader samplerate=%u != 44100 — delay math assumes 44100",
+                  _format.sampleRate);
+        }
     }
     else
     {
