@@ -1,5 +1,5 @@
 diff --git a/CMakeLists.txt b/CMakeLists.txt
-index 7e61f5266..662cb1d35 100644
+index 7e61f52..662cb1d 100644
 --- a/CMakeLists.txt
 +++ b/CMakeLists.txt
 @@ -65,7 +65,7 @@ set(PROJECTM_SO_VERSION "4")
@@ -12,7 +12,7 @@ index 7e61f5266..662cb1d35 100644
  list(APPEND CMAKE_MODULE_PATH "${PROJECTM_SOURCE_DIR}/cmake")
  
 diff --git a/src/api/CMakeLists.txt b/src/api/CMakeLists.txt
-index 3228e85b3..597a3b8e6 100644
+index 3228e85..597a3b8 100644
 --- a/src/api/CMakeLists.txt
 +++ b/src/api/CMakeLists.txt
 @@ -29,6 +29,7 @@ set(PROJECTM_PUBLIC_HEADERS
@@ -24,7 +24,7 @@ index 3228e85b3..597a3b8e6 100644
          "${CMAKE_CURRENT_SOURCE_DIR}/include/projectM-4/render_opengl.h"
          "${CMAKE_CURRENT_SOURCE_DIR}/include/projectM-4/touch.h"
 diff --git a/src/api/include/projectM-4/core.h b/src/api/include/projectM-4/core.h
-index 9a42545ac..7e95a10e3 100644
+index 9a42545..7e95a10 100644
 --- a/src/api/include/projectM-4/core.h
 +++ b/src/api/include/projectM-4/core.h
 @@ -108,6 +108,21 @@ PROJECTM_EXPORT void projectm_destroy(projectm_handle instance);
@@ -49,8 +49,80 @@ index 9a42545ac..7e95a10e3 100644
  /**
   * @brief Loads a preset from the data pointer.
   *
+diff --git a/src/api/include/projectM-4/preprocess_cache.h b/src/api/include/projectM-4/preprocess_cache.h
+new file mode 100644
+index 0000000..735d6b5
+--- /dev/null
++++ b/src/api/include/projectM-4/preprocess_cache.h
+@@ -0,0 +1,66 @@
++/**
++ * @file preprocess_cache.h
++ * @copyright 2003-2024 projectM Team
++ * @brief App-provided cache for preprocessed preset shader text (RoonVis local patch).
++ *
++ * projectM transpiles each preset's HLSL shaders on load. The first stage, the HLSL
++ * preprocessor, and the second, parse plus GLSL generation, are pure functions of their
++ * input text, so an application may cache their outputs across runs and seed the cache
++ * at build time. projectM asks the hooks before each stage and stores the result after a
++ * miss. Both hooks are invoked on the render thread only. Reconstructed in the RoonVis
++ * fork (the published patch referenced this header without carrying it).
++ */
++
++#pragma once
++
++#include "projectM-4/types.h"
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++/**
++ * @brief Delivers a cached value to projectM: called once by a get hook on a hit, with the
++ *        whole value.
++ * @param sinkctx The opaque sink context projectM passed to the get hook.
++ * @param data The cached bytes.
++ * @param len The number of bytes.
++ */
++typedef void (*projectm_preprocess_cache_sink)(void* sinkctx, const char* data, size_t len);
++
++/**
++ * @brief Looks a key up. On a hit, pass the value to @a sink exactly once and return true;
++ *        on a miss return false without calling the sink.
++ */
++typedef bool (*projectm_preprocess_cache_get)(void* user, const char* key, size_t keylen,
++                                              void* sinkctx, projectm_preprocess_cache_sink sink);
++
++/**
++ * @brief Stores a value under a key. Keys carry a stage prefix and a content hash, so
++ *        replacing an existing entry is harmless.
++ */
++typedef void (*projectm_preprocess_cache_put)(void* user, const char* key, size_t keylen,
++                                              const char* value, size_t vallen);
++
++/**
++ * @brief The hooks and the user pointer handed back to each. Either hook may be NULL: a
++ *        get-only registration serves a read-only cache, a put-only one records.
++ */
++typedef struct projectm_preprocess_cache_hooks
++{
++    projectm_preprocess_cache_get get;
++    projectm_preprocess_cache_put put;
++    void* user;
++} projectm_preprocess_cache_hooks;
++
++/**
++ * @brief Registers the cache hooks, copied by value. Pass NULL to unregister.
++ * @param instance The projectM instance handle.
++ * @param hooks The hooks, or NULL.
++ */
++PROJECTM_EXPORT void projectm_set_preprocess_cache(projectm_handle instance,
++                                                   const projectm_preprocess_cache_hooks* hooks);
++
++#ifdef __cplusplus
++} // extern "C"
++#endif
 diff --git a/src/api/include/projectM-4/projectM.h b/src/api/include/projectM-4/projectM.h
-index 5b646af4d..b76a888d8 100644
+index 5b646af..b76a888 100644
 --- a/src/api/include/projectM-4/projectM.h
 +++ b/src/api/include/projectM-4/projectM.h
 @@ -32,6 +32,7 @@
@@ -62,7 +134,7 @@ index 5b646af4d..b76a888d8 100644
  #include "projectM-4/touch.h"
  #include "projectM-4/version.h"
 diff --git a/src/libprojectM/Audio/PCM.cpp b/src/libprojectM/Audio/PCM.cpp
-index 1deea37ae..d7d18747e 100755
+index 1deea37..d7d1874 100755
 --- a/src/libprojectM/Audio/PCM.cpp
 +++ b/src/libprojectM/Audio/PCM.cpp
 @@ -62,14 +62,20 @@ void PCM::UpdateFrameAudioData(double secondsSinceLastFrame, uint32_t frame)
@@ -90,7 +162,7 @@ index 1deea37ae..d7d18747e 100755
  }
  
 diff --git a/src/libprojectM/MilkdropPreset/CMakeLists.txt b/src/libprojectM/MilkdropPreset/CMakeLists.txt
-index d6682ae8a..a280b7635 100644
+index d6682ae..a280b76 100644
 --- a/src/libprojectM/MilkdropPreset/CMakeLists.txt
 +++ b/src/libprojectM/MilkdropPreset/CMakeLists.txt
 @@ -33,6 +33,11 @@ add_custom_command(OUTPUT
@@ -133,7 +205,7 @@ index d6682ae8a..a280b7635 100644
          Waveforms/Line.cpp
          Waveforms/Line.hpp
 diff --git a/src/libprojectM/MilkdropPreset/FinalComposite.cpp b/src/libprojectM/MilkdropPreset/FinalComposite.cpp
-index 693df4493..9aa3153a6 100644
+index 693df44..9aa3153 100644
 --- a/src/libprojectM/MilkdropPreset/FinalComposite.cpp
 +++ b/src/libprojectM/MilkdropPreset/FinalComposite.cpp
 @@ -94,6 +94,34 @@ void FinalComposite::CompileCompositeShader(PresetState& presetState)
@@ -172,7 +244,7 @@ index 693df4493..9aa3153a6 100644
  {
      if (m_compositeShader)
 diff --git a/src/libprojectM/MilkdropPreset/FinalComposite.hpp b/src/libprojectM/MilkdropPreset/FinalComposite.hpp
-index 970144770..af874e016 100644
+index 9701447..af874e0 100644
 --- a/src/libprojectM/MilkdropPreset/FinalComposite.hpp
 +++ b/src/libprojectM/MilkdropPreset/FinalComposite.hpp
 @@ -31,6 +31,19 @@ public:
@@ -196,7 +268,7 @@ index 970144770..af874e016 100644
       * @brief Renders the composite quad with the appropriate effects or shaders.
       * @param presetState The preset state to retrieve the configuration values from.
 diff --git a/src/libprojectM/MilkdropPreset/MilkdropPreset.cpp b/src/libprojectM/MilkdropPreset/MilkdropPreset.cpp
-index ef1716115..e2c27c41b 100755
+index ef17161..e2c27c4 100755
 --- a/src/libprojectM/MilkdropPreset/MilkdropPreset.cpp
 +++ b/src/libprojectM/MilkdropPreset/MilkdropPreset.cpp
 @@ -27,9 +27,28 @@
@@ -400,7 +472,7 @@ index ef1716115..e2c27c41b 100755
  {
      if (m_framebuffer.Width() > 0 && m_framebuffer.Height() > 0)
 diff --git a/src/libprojectM/MilkdropPreset/MilkdropPreset.hpp b/src/libprojectM/MilkdropPreset/MilkdropPreset.hpp
-index db8eb43ba..14fb82000 100644
+index db8eb43..14fb820 100644
 --- a/src/libprojectM/MilkdropPreset/MilkdropPreset.hpp
 +++ b/src/libprojectM/MilkdropPreset/MilkdropPreset.hpp
 @@ -86,6 +86,18 @@ public:
@@ -454,7 +526,7 @@ index db8eb43ba..14fb82000 100644
  
  } // namespace MilkdropPreset
 diff --git a/src/libprojectM/MilkdropPreset/MilkdropShader.cpp b/src/libprojectM/MilkdropPreset/MilkdropShader.cpp
-index 10cf919ca..995c13c48 100644
+index 10cf919..995c13c 100644
 --- a/src/libprojectM/MilkdropPreset/MilkdropShader.cpp
 +++ b/src/libprojectM/MilkdropPreset/MilkdropShader.cpp
 @@ -1,5 +1,7 @@
@@ -831,8 +903,323 @@ index 10cf919ca..995c13c48 100644
      }
  }
  
+diff --git a/src/libprojectM/MilkdropPreset/MilkdropShaderPreprocess.cpp b/src/libprojectM/MilkdropPreset/MilkdropShaderPreprocess.cpp
+new file mode 100644
+index 0000000..7f9ffc4
+--- /dev/null
++++ b/src/libprojectM/MilkdropPreset/MilkdropShaderPreprocess.cpp
+@@ -0,0 +1,254 @@
++#include "MilkdropShaderPreprocess.hpp"
++
++#include "MilkdropStaticShaders.hpp"
++#include "Logging.hpp"
++#include "Renderer/Shader.hpp"
++#include "Utils.hpp"
++
++#include <cstdint>
++#include <cstdio>
++
++namespace libprojectM {
++namespace MilkdropPreset {
++
++namespace {
++
++// 64-bit FNV-1a over the bytes of a string, from the given offset basis.
++auto Fnv1a64(const std::string& data, uint64_t hash) -> uint64_t
++{
++    for (unsigned char c : data)
++    {
++        hash ^= static_cast<uint64_t>(c);
++        hash *= 0x100000001b3ULL;
++    }
++    return hash;
++}
++
++constexpr uint64_t kFnvBasis = 0xcbf29ce484222325ULL;
++// The second lane: the same function from a different basis (the first lane's basis
++// with its halves swapped), so two inputs colliding on one lane keep distinct keys.
++constexpr uint64_t kFnvBasisSecond = 0x84222325cbf29ce4ULL;
++
++auto Hex64(uint64_t value) -> std::string
++{
++    char buffer[17];
++    std::snprintf(buffer, sizeof(buffer), "%016llx", static_cast<unsigned long long>(value));
++    return buffer;
++}
++
++// salt + 32 hex characters of content hash + "-" + the input length in hex.
++auto ComputeKey(const std::string& salt, const std::string& input) -> std::string
++{
++    char length[32];
++    std::snprintf(length, sizeof(length), "%zx", input.size());
++    return salt + Hex64(Fnv1a64(input, kFnvBasis)) + Hex64(Fnv1a64(input, kFnvBasisSecond)) + "-" + length;
++}
++
++} // namespace
++
++auto PreprocessCacheSalt() -> const std::string&
++{
++    static const std::string salt = "pmpp-v1:";
++    return salt;
++}
++
++auto ParseGenCacheSalt() -> const std::string&
++{
++    static const std::string salt = "pmpp-parse-v1:";
++    return salt;
++}
++
++auto ComputePreprocessCacheKey(const std::string& preprocessorInput) -> std::string
++{
++    return ComputeKey(PreprocessCacheSalt(), preprocessorInput);
++}
++
++auto ComputeParseGenCacheKey(const std::string& parserInput) -> std::string
++{
++    return ComputeKey(ParseGenCacheSalt(), parserInput);
++}
++
++auto AssembleApplyPreprocessorInput(MilkdropShader::ShaderType type, const std::string& body) -> std::string
++{
++    std::string program = body;
++
++    std::string shaderTypeString = "composite";
++    if (type == MilkdropShader::ShaderType::WarpShader)
++    {
++        shaderTypeString = "warp";
++    }
++
++    if (program.length() <= 0)
++    {
++        throw Renderer::ShaderException("[MilkdropShader] Preset " + shaderTypeString + " shader is declared, but empty.");
++    }
++
++    size_t found;
++
++    // Find "sampler_state" overrides and remove them first, as they're not supported by GLSL.
++    // The logic isn't totally fool-proof, but should work in general.
++    // Use a comment-stripped copy for searching so commented-out sampler_state blocks are skipped.
++    // StripComments preserves string length, so positions map 1:1 to the original.
++    std::string stripped = Utils::StripComments(program);
++    found = stripped.find("sampler_state");
++    while (found != std::string::npos)
++    {
++        // Now go backwards and find the assignment
++        found = stripped.rfind('=', found);
++        auto startPos = found;
++
++        // Find closing brace and semicolon
++        found = stripped.find('}', found);
++        found = stripped.find(';', found);
++
++        if (found != std::string::npos)
++        {
++            stripped.replace(startPos, found - startPos, "");
++        }
++        else
++        {
++            // No closing brace and semicolon.
++            break;
++        }
++
++        found = stripped.find("sampler_state");
++    }
++
++    // replace shader_body with entry point function
++    // Use the stripped copy so a commented-out shader_body is not matched.
++    found = stripped.find("shader_body");
++    if (found != std::string::npos)
++    {
++        if (type == MilkdropShader::ShaderType::WarpShader)
++        {
++            program.replace(int(found), 11, R"(
++void PS(float4 _vDiffuse : COLOR,
++        float4 _uv : TEXCOORD0,
++        float2 _rad_ang : TEXCOORD1,
++        out float4 _return_value : COLOR0,
++        out float4 _mv_tex_coords : COLOR1)
++)");
++        }
++        else
++        {
++            program.replace(int(found), 11, R"(
++void PS(float4 _vDiffuse : COLOR,
++        float2 _uv : TEXCOORD0,
++        float2 _rad_ang : TEXCOORD1,
++        out float4 _return_value : COLOR)
++)");
++        }
++    }
++    else
++    {
++        LOG_DEBUG("[MilkdropShader] Failed " + shaderTypeString + " shader code:\n" + program);
++        throw Renderer::ShaderException("[MilkdropShader] Preset " + shaderTypeString + " shader is missing \"shader_body\" entry point.");
++    }
++
++    // replace the "{" immediately following shader_body with some variable declarations
++    found = program.find('{', found);
++    if (found != std::string::npos)
++    {
++        std::string progMain = "{\nfloat3 ret = 0;\n";
++        if (type == MilkdropShader::ShaderType::WarpShader)
++        {
++            progMain.append("_mv_tex_coords.xy = _uv.xy;\n");
++        }
++        program.replace(int(found), 1, progMain);
++    }
++    else
++    {
++        LOG_DEBUG("[MilkdropShader] Failed " + shaderTypeString + " shader code:\n" + program);
++        throw Renderer::ShaderException("[MilkdropShader] Preset " + shaderTypeString + " shader has no opening braces.");
++    }
++
++    // replace "}" with return statement (this can probably be optimized for the GLSL conversion...)
++    found = program.rfind('}');
++    if (found != std::string::npos)
++    {
++        program.replace(int(found), 1, "_return_value = float4(ret.xyz, 1.0);\n"
++                                       "}\n");
++    }
++    else
++    {
++        LOG_DEBUG("[MilkdropShader] Failed " + shaderTypeString + " shader code:\n" + program);
++        throw Renderer::ShaderException("[MilkdropShader] Preset " + shaderTypeString + " shader has no closing brace.");
++    }
++
++    // Find matching closing brace and cut off excess text after shader's main function
++    int bracesOpen = 1;
++    size_t pos = found + 1;
++    for (; pos < program.length() && bracesOpen > 0; ++pos)
++    {
++        switch (program.at(pos))
++        {
++            case '/':
++                // Skip line comments until EoL to prevent false counting
++                if (pos < program.length() - 1 && program.at(pos + 1) == '/')
++                {
++                    for (; pos < program.length(); ++pos)
++                    {
++                        if (program.at(pos) == '\n')
++                        {
++                            break;
++                        }
++                    }
++                }
++                // Skip block comments to prevent false counting
++                else if (pos < program.length() - 1 && program.at(pos + 1) == '*')
++                {
++                    pos += 2;
++                    for (; pos < program.length() - 1; ++pos)
++                    {
++                        if (program.at(pos) == '*' && program.at(pos + 1) == '/')
++                        {
++                            ++pos; // skip past '/'
++                            break;
++                        }
++                    }
++                }
++                continue;
++
++            case '{':
++                bracesOpen++;
++                continue;
++
++            case '}':
++                bracesOpen--;
++        }
++    }
++
++    if (pos < program.length() - 1)
++    {
++        program.resize(pos);
++    }
++
++    std::string fullSource; //!< Full shader source before translation, includes all uniforms etc.
++
++    // First copy the generic "header" into the shader. Includes uniforms and some defines
++    // to unwrap the packed 4-element uniforms into single values.
++    fullSource.append(MilkdropStaticShaders::Get()->GetPresetShaderHeader());
++
++    if (type == MilkdropShader::ShaderType::WarpShader)
++    {
++        fullSource.append("#define rad _rad_ang.x\n"
++                          "#define ang _rad_ang.y\n"
++                          "#define uv _uv.xy\n"
++                          "#define uv_orig _uv.zw\n");
++    }
++    else
++    {
++        fullSource.append("#define rad _rad_ang.x\n"
++                          "#define ang _rad_ang.y\n"
++                          "#define uv _uv.xy\n"
++                          "#define uv_orig _uv.xy\n"
++                          "#define hue_shader _vDiffuse.xyz\n");
++    }
++
++    fullSource.append(program);
++
++    return fullSource;
++}
++
++} // namespace MilkdropPreset
++} // namespace libprojectM
+diff --git a/src/libprojectM/MilkdropPreset/MilkdropShaderPreprocess.hpp b/src/libprojectM/MilkdropPreset/MilkdropShaderPreprocess.hpp
+new file mode 100644
+index 0000000..e671ff9
+--- /dev/null
++++ b/src/libprojectM/MilkdropPreset/MilkdropShaderPreprocess.hpp
+@@ -0,0 +1,49 @@
++/**
++ * @file MilkdropShaderPreprocess.hpp
++ * @brief GL-free pieces of the preset shader transpile path (RoonVis local patch).
++ *
++ * The text assembly that MilkdropShader::PreprocessPresetShader performs before the HLSL
++ * preprocessor runs, and the cache keys for the two cacheable stages, as free functions
++ * with no GL dependency: a build-time host tool computes the same bytes and the same keys
++ * as the device, which is what lets the app ship a prepopulated cache.
++ *
++ * Reconstructed in the RoonVis fork from the published patch's call sites and the shipped
++ * cache resource (its salts and key shapes); the original file was never committed.
++ */
++
++#pragma once
++
++#include "MilkdropShader.hpp"
++
++#include <string>
++
++namespace libprojectM {
++namespace MilkdropPreset {
++
++/**
++ * @brief Builds the HLSL preprocessor input for a preset shader body, byte for byte as
++ *        MilkdropShader::PreprocessPresetShader did before the extraction: strips
++ *        sampler_state overrides, replaces shader_body with the PS entry point, cuts the
++ *        text after the entry point's closing brace, and prepends the static preset shader
++ *        header and the per-type defines.
++ * @throws Renderer::ShaderException for an empty body, a missing shader_body or missing braces.
++ */
++auto AssembleApplyPreprocessorInput(MilkdropShader::ShaderType type, const std::string& body) -> std::string;
++
++/** @brief The stage-1 (preprocessor) key prefix; bumped when the preprocess path changes. */
++auto PreprocessCacheSalt() -> const std::string&;
++
++/** @brief The stage-2 (parse + GLSL generation) key prefix. */
++auto ParseGenCacheSalt() -> const std::string&;
++
++/**
++ * @brief The stage-1 cache key of a preprocessor input: salt, a 128-bit content hash in hex
++ *        and the input length in hex.
++ */
++auto ComputePreprocessCacheKey(const std::string& preprocessorInput) -> std::string;
++
++/** @brief The stage-2 cache key of a parser input, same shape under the stage-2 salt. */
++auto ComputeParseGenCacheKey(const std::string& parserInput) -> std::string;
++
++} // namespace MilkdropPreset
++} // namespace libprojectM
 diff --git a/src/libprojectM/MilkdropPreset/PerFrameContext.cpp b/src/libprojectM/MilkdropPreset/PerFrameContext.cpp
-index b2063825b..23be83435 100644
+index b206382..23be834 100644
 --- a/src/libprojectM/MilkdropPreset/PerFrameContext.cpp
 +++ b/src/libprojectM/MilkdropPreset/PerFrameContext.cpp
 @@ -1,6 +1,7 @@
@@ -865,7 +1252,7 @@ index b2063825b..23be83435 100644
      {
          std::string error;
 diff --git a/src/libprojectM/MilkdropPreset/PerPixelContext.cpp b/src/libprojectM/MilkdropPreset/PerPixelContext.cpp
-index 2942a7f2f..c2d512328 100644
+index 2942a7f..c2d5123 100644
 --- a/src/libprojectM/MilkdropPreset/PerPixelContext.cpp
 +++ b/src/libprojectM/MilkdropPreset/PerPixelContext.cpp
 @@ -2,6 +2,7 @@
@@ -888,7 +1275,7 @@ index 2942a7f2f..c2d512328 100644
      {
          std::string error;
 diff --git a/src/libprojectM/MilkdropPreset/PerPixelMesh.cpp b/src/libprojectM/MilkdropPreset/PerPixelMesh.cpp
-index 0c4a7b9a1..bfd977596 100644
+index 0c4a7b9..bfd9775 100644
 --- a/src/libprojectM/MilkdropPreset/PerPixelMesh.cpp
 +++ b/src/libprojectM/MilkdropPreset/PerPixelMesh.cpp
 @@ -11,11 +11,93 @@
@@ -1075,7 +1462,7 @@ index 0c4a7b9a1..bfd977596 100644
  
  void PerPixelMesh::WarpedBlit(const PresetState& presetState,
 diff --git a/src/libprojectM/MilkdropPreset/PerPixelMesh.hpp b/src/libprojectM/MilkdropPreset/PerPixelMesh.hpp
-index dda77f114..b96294eb7 100644
+index dda77f1..b96294e 100644
 --- a/src/libprojectM/MilkdropPreset/PerPixelMesh.hpp
 +++ b/src/libprojectM/MilkdropPreset/PerPixelMesh.hpp
 @@ -11,6 +11,55 @@ class PerFrameContext;
@@ -1154,7 +1541,7 @@ index dda77f114..b96294eb7 100644
       * @brief Renders the transformation mesh.
       * @param presetState The preset state to retrieve the configuration values from.
 diff --git a/src/libprojectM/MilkdropPreset/ShapePerFrameContext.cpp b/src/libprojectM/MilkdropPreset/ShapePerFrameContext.cpp
-index e31f5332d..1a2842b71 100644
+index e31f533..1a2842b 100644
 --- a/src/libprojectM/MilkdropPreset/ShapePerFrameContext.cpp
 +++ b/src/libprojectM/MilkdropPreset/ShapePerFrameContext.cpp
 @@ -2,6 +2,7 @@
@@ -1187,7 +1574,7 @@ index e31f5332d..1a2842b71 100644
      {
          std::string error;
 diff --git a/src/libprojectM/MilkdropPreset/WaveformPerFrameContext.cpp b/src/libprojectM/MilkdropPreset/WaveformPerFrameContext.cpp
-index c80a00647..513dc8b27 100644
+index c80a006..513dc8b 100644
 --- a/src/libprojectM/MilkdropPreset/WaveformPerFrameContext.cpp
 +++ b/src/libprojectM/MilkdropPreset/WaveformPerFrameContext.cpp
 @@ -3,6 +3,7 @@
@@ -1220,7 +1607,7 @@ index c80a00647..513dc8b27 100644
      {
          std::string error;
 diff --git a/src/libprojectM/MilkdropPreset/WaveformPerPointContext.cpp b/src/libprojectM/MilkdropPreset/WaveformPerPointContext.cpp
-index e73fed4ae..a8de3a9bc 100644
+index e73fed4..a8de3a9 100644
 --- a/src/libprojectM/MilkdropPreset/WaveformPerPointContext.cpp
 +++ b/src/libprojectM/MilkdropPreset/WaveformPerPointContext.cpp
 @@ -3,6 +3,7 @@
@@ -1243,7 +1630,7 @@ index e73fed4ae..a8de3a9bc 100644
      {
          std::string error;
 diff --git a/src/libprojectM/Preset.hpp b/src/libprojectM/Preset.hpp
-index c96b1bf7f..2b8772ea8 100644
+index c96b1bf..2b8772e 100644
 --- a/src/libprojectM/Preset.hpp
 +++ b/src/libprojectM/Preset.hpp
 @@ -60,6 +60,23 @@ public:
@@ -1271,7 +1658,7 @@ index c96b1bf7f..2b8772ea8 100644
      {
          m_filename = filename;
 diff --git a/src/libprojectM/ProjectM.cpp b/src/libprojectM/ProjectM.cpp
-index a042f244c..05886726e 100644
+index a042f24..0588672 100644
 --- a/src/libprojectM/ProjectM.cpp
 +++ b/src/libprojectM/ProjectM.cpp
 @@ -30,13 +30,47 @@
@@ -1703,7 +2090,7 @@ index a042f244c..05886726e 100644
      if (m_transition)
      {
 diff --git a/src/libprojectM/ProjectM.hpp b/src/libprojectM/ProjectM.hpp
-index 9879e77f0..83f10ffe6 100644
+index 9879e77..83f10ff 100644
 --- a/src/libprojectM/ProjectM.hpp
 +++ b/src/libprojectM/ProjectM.hpp
 @@ -89,6 +89,20 @@ public:
@@ -1769,7 +2156,7 @@ index 9879e77f0..83f10ffe6 100644
  
  } // namespace libprojectM
 diff --git a/src/libprojectM/ProjectMCWrapper.cpp b/src/libprojectM/ProjectMCWrapper.cpp
-index cd2bca2f2..3af4ab131 100644
+index cd2bca2..3af4ab1 100644
 --- a/src/libprojectM/ProjectMCWrapper.cpp
 +++ b/src/libprojectM/ProjectMCWrapper.cpp
 @@ -114,6 +114,30 @@ void projectm_load_preset_file(projectm_handle instance, const char* filename,
@@ -1825,7 +2212,7 @@ index cd2bca2f2..3af4ab131 100644
 \ No newline at end of file
 +}
 diff --git a/src/libprojectM/Renderer/Platform/GLResolver.cpp b/src/libprojectM/Renderer/Platform/GLResolver.cpp
-index 21eb4acaa..6dcb293ae 100644
+index 21eb4ac..6dcb293 100644
 --- a/src/libprojectM/Renderer/Platform/GLResolver.cpp
 +++ b/src/libprojectM/Renderer/Platform/GLResolver.cpp
 @@ -404,9 +404,20 @@ auto GLResolver::Initialize(UserResolver resolver, void* userData) -> bool
@@ -1853,7 +2240,7 @@ index 21eb4acaa..6dcb293ae 100644
      }
  
 diff --git a/src/libprojectM/Renderer/Platform/GladLoader.cpp b/src/libprojectM/Renderer/Platform/GladLoader.cpp
-index 0cb30ae46..0978a829f 100644
+index 0cb30ae..0978a82 100644
 --- a/src/libprojectM/Renderer/Platform/GladLoader.cpp
 +++ b/src/libprojectM/Renderer/Platform/GladLoader.cpp
 @@ -47,8 +47,8 @@ auto GladLoader::CheckGLRequirements() -> bool
@@ -1868,7 +2255,7 @@ index 0cb30ae46..0978a829f 100644
          //        .WithRequiredExtension("GL_OES_standard_derivatives")
          .WithRequireCoreProfile(false);
 diff --git a/src/libprojectM/Renderer/RenderContext.hpp b/src/libprojectM/Renderer/RenderContext.hpp
-index 9fec280dc..f00e702f7 100644
+index 9fec280..f00e702 100644
 --- a/src/libprojectM/Renderer/RenderContext.hpp
 +++ b/src/libprojectM/Renderer/RenderContext.hpp
 @@ -5,6 +5,7 @@
@@ -1891,7 +2278,7 @@ index 9fec280dc..f00e702f7 100644
  
  } // namespace Renderer
 diff --git a/src/libprojectM/Renderer/Shader.cpp b/src/libprojectM/Renderer/Shader.cpp
-index 58e03ae79..704bd97de 100644
+index 58e03ae..704bd97 100644
 --- a/src/libprojectM/Renderer/Shader.cpp
 +++ b/src/libprojectM/Renderer/Shader.cpp
 @@ -3,11 +3,24 @@
@@ -2093,7 +2480,7 @@ index 58e03ae79..704bd97de 100644
      if (shaderCompiled == GL_TRUE)
      {
 diff --git a/src/libprojectM/Renderer/Shader.hpp b/src/libprojectM/Renderer/Shader.hpp
-index 79b2f15ca..39be49a69 100644
+index 79b2f15..39be49a 100644
 --- a/src/libprojectM/Renderer/Shader.hpp
 +++ b/src/libprojectM/Renderer/Shader.hpp
 @@ -79,6 +79,44 @@ public:
@@ -2163,3 +2550,9 @@ index 79b2f15ca..39be49a69 100644
  };
  
  } // namespace Renderer
+diff --git a/vendor/projectm-eval b/vendor/projectm-eval
+--- a/vendor/projectm-eval
++++ b/vendor/projectm-eval
+@@ -1 +1 @@
+-Subproject commit da885dcdf33620ef26aa04cac9e215378b80252e
++Subproject commit da885dcdf33620ef26aa04cac9e215378b80252e-dirty
